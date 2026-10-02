@@ -98,7 +98,8 @@ async def api_mount_stream(req: MountRequest, request: Request):
         "stream_endpoints": {
             "webdav_folder": f"{base_url}/dav/",
             "webdav_file": f"{base_url}/dav/{filename}",
-            "vlc_intent": f"vlc://{base_url}/dav/{filename}",
+            "direct_stream": f"{base_url}/dav/{filename}",
+            "vlc_intent": f"intent:{base_url}/dav/{filename}#Intent;action=android.intent.action.VIEW;type=video/*;end",
             "cx_file_explorer": {
                 "server": request.url.hostname or "localhost",
                 "port": request.url.port or (443 if request.url.scheme == "https" else 80),
@@ -166,4 +167,5 @@ async def webdav_dispatcher(request: Request, path: str = ""):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=7860, reload=False)
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
