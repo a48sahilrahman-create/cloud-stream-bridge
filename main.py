@@ -6,11 +6,16 @@ Designed for 1-Click Zero-Cost Cloud Deployment (Hugging Face Spaces / Render / 
 
 import os
 import time
+import asyncio
+import logging
 from typing import Optional
 from pydantic import BaseModel
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+logger = logging.getLogger("cloudstream_main")
 
 from stream_probe import probe_stream
 from webdav_engine import handle_webdav_request, mount_manager
@@ -150,6 +155,47 @@ async def api_status():
         "home_bandwidth_saved_gb": bandwidth_saved_gb,
         "mounted_count": len(mount_manager.list_all())
     }
+
+
+@app.get("/ping")
+@app.get("/health")
+async def api_ping():
+    """
+    Lightweight health and keep-alive endpoint for cloud hosting daemons.
+    """
+    return {
+        "status": "online",
+        "service": "cloud-stream-bridge",
+        "timestamp": time.time(),
+        "mounted_count": len(mount_manager.list_all())
+    }
+
+
+async def keep_alive_daemon():
+    """
+    Automatic cloud keep-alive daemon:
+    Pings RENDER_EXTERNAL_URL or KEEP_ALIVE_URL every 10 minutes to prevent
+    free-tier inactivity sleep on Render / cloud containers.
+    """
+    target = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEP_ALIVE_URL")
+    if not target:
+        return
+    ping_url = f"{target.rstrip('/')}/ping"
+    logger.info(f"Keep-alive self-ping loop started for: {ping_url} (every 10m)")
+    await asyncio.sleep(60)  # Initial grace period on boot
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+                res = await client.get(ping_url)
+                logger.info(f"[Keep-Alive] Ping {ping_url} -> {res.status_code}")
+        except Exception as e:
+            logger.warning(f"[Keep-Alive] Ping {ping_url} failed: {e}")
+        await asyncio.sleep(600)  # 10 minutes
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(keep_alive_daemon())
 
 
 # WebDAV Endpoints (RFC 4918 Virtual Mount)
