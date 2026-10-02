@@ -252,6 +252,69 @@ def test_webdav_head_request():
     mount_manager.remove_mount("HeadTest.mkv")
 
 
+def test_root_fallback_file_routing():
+    """Verify CX File Explorer connecting to '/' without '/dav' can HEAD and stream files."""
+    mount_manager.add_mount(
+        movie_id="root_fallback_test",
+        filename="RootFallbackMovie.mkv",
+        upstream_url="https://example.com/fallback.mkv",
+        total_bytes=35000000000,
+        content_type="video/x-matroska",
+        formatted_size="32.60 GB"
+    )
+    try:
+        # Client requests file directly at root /RootFallbackMovie.mkv
+        resp = client.head("/RootFallbackMovie.mkv")
+        assert resp.status_code == 200
+        assert resp.headers.get("Accept-Ranges") == "bytes"
+        assert resp.headers.get("Content-Length") == "35000000000"
+
+        # PROPFIND on file at root
+        resp_pf = client.request("PROPFIND", "/RootFallbackMovie.mkv")
+        assert resp_pf.status_code == 207
+        assert "RootFallbackMovie.mkv" in resp_pf.text
+    finally:
+        mount_manager.remove_mount("RootFallbackMovie.mkv")
+
+
+def test_xml_entity_escaping():
+    """Verify filenames with XML special characters (&, <, >) escape cleanly."""
+    mount_manager.add_mount(
+        movie_id="escape_test",
+        filename="Tom & Jerry <2024>.mkv",
+        upstream_url="https://example.com/escape.mkv",
+        total_bytes=10000000,
+        content_type="video/x-matroska",
+        formatted_size="9.54 MB"
+    )
+    try:
+        xml_content = build_propfind_xml("/dav/", depth="1")
+        assert "Tom &amp; Jerry &lt;2024&gt;.mkv" in xml_content
+        # Ensure it parses as valid XML
+        root = ET.fromstring(xml_content)
+        assert root is not None
+    finally:
+        mount_manager.remove_mount("Tom & Jerry <2024>.mkv")
+
+
+def test_webdav_proppatch():
+    """Verify PROPPATCH returns 207 Multi-Status for client property updates."""
+    resp = client.request("PROPPATCH", "/dav/")
+    assert resp.status_code == 207
+    assert "<D:multistatus" in resp.text
+
+
+def test_permissive_basic_auth():
+    """Verify clients sending credentials like admin:none are accepted."""
+    import base64
+    creds = base64.b64encode(b"admin:none").decode("ascii")
+    headers = {"Authorization": f"Basic {creds}", "Depth": "1"}
+    resp = client.request("PROPFIND", "/dav", headers=headers)
+    assert resp.status_code == 207
+    assert "<D:multistatus" in resp.text
+
+
+
 @pytest.mark.asyncio
 async def test_stream_probe_container_detection(monkeypatch):
     """Verify stream probe accurately detects MKV EBML magic bytes and Content-Range total size."""
@@ -301,6 +364,46 @@ async def test_stream_probe_container_detection(monkeypatch):
     assert "MKV (Matroska" in result["container_format"]
     assert result["total_bytes"] == 85899345920
     assert "80.0 GB" in result["formatted_size"]
+
+
+def test_koyeb_cloud_health_checks():
+    """
+    Verify Koyeb, Render, and cloud hosting health checks pass on /, /health, and /ping
+    for both GET and HEAD methods. Also verify 404 fallback handling.
+    """
+    # 1. Root / health checks (GET and HEAD)
+    resp_root_get = client.get("/")
+    assert resp_root_get.status_code == 200
+    assert "text/html" in resp_root_get.headers.get("content-type", "")
+
+    resp_root_head = client.head("/")
+    assert resp_root_head.status_code == 200
+
+    # 2. /health health checks (GET and HEAD)
+    resp_health_get = client.get("/health")
+    assert resp_health_get.status_code == 200
+    assert resp_health_get.json()["status"] == "online"
+    assert resp_health_get.json()["service"] == "cloud-stream-bridge"
+
+    resp_health_head = client.head("/health")
+    assert resp_health_head.status_code == 200
+
+    # 3. /ping health checks (GET and HEAD)
+    resp_ping_get = client.get("/ping")
+    assert resp_ping_get.status_code == 200
+    assert resp_ping_get.json()["status"] == "online"
+
+    resp_ping_head = client.head("/ping")
+    assert resp_ping_head.status_code == 200
+
+    # 4. Fallback 404 handling without NameError
+    resp_fav = client.get("/favicon.ico")
+    assert resp_fav.status_code == 404
+    assert resp_fav.text == "Not Found"
+
+    resp_api_404 = client.get("/api/unknown_endpoint")
+    assert resp_api_404.status_code == 404
+    assert resp_api_404.text == "Not Found"
 
 
 if __name__ == "__main__":

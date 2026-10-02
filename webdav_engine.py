@@ -11,11 +11,17 @@ Methods:
 import time
 import os
 import json
+import base64
 import email.utils
+from xml.sax.saxutils import escape
 from typing import Dict, Any, Optional
 from starlette.requests import Request
 from starlette.responses import Response, PlainTextResponse
 from range_proxy import stream_range_proxy
+
+def xml_escape(val: Any) -> str:
+    """Escape special characters (&, <, >, \", ') for safe XML injection."""
+    return escape(str(val), {'"': "&quot;", "'": "&apos;"})
 
 # Mount registry store
 MOUNTS_DB_PATH = os.path.join(os.path.dirname(__file__), "mounts.json")
@@ -90,20 +96,22 @@ def format_http_date(timestamp: float) -> str:
 
 def _build_file_propstat(mount: Dict[str, Any], base_path: str) -> list:
     filename = mount["filename"]
+    safe_filename = xml_escape(filename)
     total_bytes = mount.get("total_bytes", 0)
     content_type = mount.get("content_type", "video/x-matroska")
     created_at = mount.get("created_at", time.time())
     mod_date = format_http_date(created_at)
     iso_creation_date = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(created_at))
-    href = f"{base_path.rstrip('/')}/{filename}"
-    etag = f'"{abs(hash(href))}"'
+    raw_href = f"{base_path.rstrip('/')}/{filename}"
+    safe_href = xml_escape(raw_href)
+    etag = f'"{abs(hash(raw_href))}"'
 
     return [
         '  <D:response>',
-        f'    <D:href>{href}</D:href>',
+        f'    <D:href>{safe_href}</D:href>',
         '    <D:propstat>',
         '      <D:prop>',
-        f'        <D:displayname>{filename}</D:displayname>',
+        f'        <D:displayname>{safe_filename}</D:displayname>',
         '        <D:resourcetype/>',
         f'        <D:getcontentlength>{total_bytes}</D:getcontentlength>',
         f'        <D:getcontenttype>{content_type}</D:getcontenttype>',
@@ -141,12 +149,13 @@ def build_propfind_xml(base_path: str, depth: str = "1", target_file: Optional[D
     now_date = format_http_date(now_ts)
     iso_creation_date = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now_ts))
     etag = f'"{abs(hash(base_path))}"'
+    safe_base_path = xml_escape(base_path)
 
     xml_lines = [
         '<?xml version="1.0" encoding="utf-8"?>',
         '<D:multistatus xmlns:D="DAV:">',
         '  <D:response>',
-        f'    <D:href>{base_path}</D:href>',
+        f'    <D:href>{safe_base_path}</D:href>',
         '    <D:propstat>',
         '      <D:prop>',
         '        <D:displayname>CloudStream Movies</D:displayname>',
@@ -181,6 +190,28 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
     base_dav_path = raw_path if not path else "/" + "/".join(str(request.url.path).strip("/").split("/")[:-1]).rstrip("/") + "/"
     if str(request.url.path) == "/" or base_dav_path == "//":
         base_dav_path = "/"
+
+    # 0. Basic Authentication Validation (Optional via env)
+    required_user = os.environ.get("WEBDAV_USER")
+    required_pass = os.environ.get("WEBDAV_PASS")
+    if required_user and required_pass:
+        auth_header = request.headers.get("Authorization", "")
+        authorized = False
+        if auth_header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode("utf-8", errors="ignore")
+                if ":" in decoded:
+                    u, p = decoded.split(":", 1)
+                    if u == required_user and p == required_pass:
+                        authorized = True
+            except Exception:
+                pass
+        if not authorized:
+            return Response(
+                content="Authentication required.",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="CloudStream WebDAV Bridge"'}
+            )
 
     # 1. OPTIONS Method
     if method == "OPTIONS":
@@ -219,7 +250,32 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
             }
         )
 
-    # 3. Path resolution for specific file
+    # 3. PROPPATCH Method (Property update acknowledgement)
+    if method == "PROPPATCH":
+        target_path = xml_escape(str(request.url.path))
+        proppatch_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<D:multistatus xmlns:D="DAV:">\n'
+            '  <D:response>\n'
+            f'    <D:href>{target_path}</D:href>\n'
+            '    <D:propstat>\n'
+            '      <D:prop/>\n'
+            '      <D:status>HTTP/1.1 200 OK</D:status>\n'
+            '    </D:propstat>\n'
+            '  </D:response>\n'
+            '</D:multistatus>'
+        ).encode("utf-8")
+        return Response(
+            content=proppatch_xml,
+            status_code=207,
+            headers={
+                "Content-Type": 'application/xml; charset="utf-8"',
+                "DAV": "1",
+                "Content-Length": str(len(proppatch_xml))
+            }
+        )
+
+    # 4. Path resolution for specific file
     if not path:
         # Requesting root /dav/ with GET or HEAD
         return PlainTextResponse("CloudStream WebDAV Bridge Active. Connect via CX File Explorer.", status_code=200)

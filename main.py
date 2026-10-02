@@ -12,7 +12,7 @@ from typing import Optional
 from pydantic import BaseModel
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("cloudstream_main")
@@ -110,8 +110,8 @@ async def api_mount_stream(req: MountRequest, request: Request):
                 "port": request.url.port or (443 if request.url.scheme == "https" else 80),
                 "path": "/dav",
                 "https": request.url.scheme == "https",
-                "username": "admin",
-                "password": "none"
+                "anonymous": True,
+                "auth_note": "Check 'Anonymous' box in CX File Explorer"
             }
         }
     }
@@ -157,11 +157,12 @@ async def api_status():
     }
 
 
-@app.get("/ping")
-@app.get("/health")
+@app.api_route("/ping", methods=["GET", "HEAD"])
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def api_ping():
     """
     Lightweight health and keep-alive endpoint for cloud hosting daemons.
+    Supports both GET and HEAD requests across Koyeb, Render, Hugging Face, etc.
     """
     return {
         "status": "online",
@@ -174,10 +175,13 @@ async def api_ping():
 async def keep_alive_daemon():
     """
     Automatic cloud keep-alive daemon:
-    Pings RENDER_EXTERNAL_URL or KEEP_ALIVE_URL every 10 minutes to prevent
-    free-tier inactivity sleep on Render / cloud containers.
+    Pings RENDER_EXTERNAL_URL, KOYEB_PUBLIC_DOMAIN, or KEEP_ALIVE_URL every 10 minutes to prevent
+    free-tier inactivity sleep on Render / Koyeb / cloud containers.
     """
     target = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEP_ALIVE_URL")
+    if not target and os.environ.get("KOYEB_PUBLIC_DOMAIN"):
+        kdomain = os.environ["KOYEB_PUBLIC_DOMAIN"]
+        target = kdomain if kdomain.startswith("http") else f"https://{kdomain}"
     if not target:
         return
     ping_url = f"{target.rstrip('/')}/ping"
@@ -209,6 +213,15 @@ async def webdav_dispatcher(request: Request, path: str = ""):
             if os.path.exists(index_path):
                 return FileResponse(index_path, media_type="text/html")
     return await handle_webdav_request(request, path)
+
+
+# Root Fallback Dispatcher for clients that mount without /dav (e.g. CX File Explorer with empty Path)
+@app.api_route("/{filename:path}", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH"])
+async def root_fallback_dispatcher(request: Request, filename: str):
+    clean_fn = filename.strip("/")
+    if clean_fn.startswith("api/") or clean_fn in ("ping", "health", "favicon.ico"):
+        return PlainTextResponse("Not Found", status_code=404)
+    return await handle_webdav_request(request, clean_fn)
 
 
 if __name__ == "__main__":

@@ -102,17 +102,23 @@
             <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>
             CX File Explorer WebDAV Configuration (Android TV / Phone)
           </h2>
-          <p class="text-xs text-slate-400">Open CX File Explorer &gt; Network &gt; New Location (+) &gt; Remote &gt; WebDAV</p>
+          <p class="text-xs text-slate-400">Open CX File Explorer &gt; Network &gt; New Location (+) &gt; Remote &gt; WebDAV • <span class="text-emerald-400 font-medium">For Koyeb: Check Anonymous &amp; set Path to /dav</span></p>
         </div>
-        <button onclick="copyDavUrl()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-1.5 self-start sm:self-auto">
-          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"></path></svg>
-          <span id="copy-btn-text">Copy Full WebDAV URL</span>
-        </button>
+        <div class="flex items-center gap-2 self-start sm:self-auto flex-wrap">
+          <button onclick="copyHostOnly()" class="text-xs bg-indigo-900/60 hover:bg-indigo-800 text-indigo-200 px-3 py-1.5 rounded-lg border border-indigo-700/50 transition flex items-center gap-1.5">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"></path></svg>
+            <span id="copy-host-btn-text">Copy Host (No https://)</span>
+          </button>
+          <button onclick="copyDavUrl()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-1.5">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"></path></svg>
+            <span id="copy-btn-text">Copy Full WebDAV URL</span>
+          </button>
+        </div>
       </div>
 
       <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-4 text-xs">
         <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800">
-          <span class="text-slate-400 block text-[11px]">Host / Server</span>
+          <span class="text-slate-400 block text-[11px]">Host (Do NOT add https://)</span>
           <span id="cx-host" class="font-mono text-slate-200 font-semibold break-all select-all block mt-0.5 text-[11px]">...</span>
         </div>
         <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800">
@@ -128,8 +134,16 @@
           <span id="cx-encryption" class="font-mono text-emerald-400 font-semibold block mt-0.5">HTTPS (ON)</span>
         </div>
         <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800 col-span-2 sm:col-span-1">
-          <span class="text-slate-400 block text-[11px]">Auth</span>
-          <span class="font-mono text-slate-300 block mt-0.5">Anonymous / admin</span>
+          <span class="text-slate-400 block text-[11px]">Auth Checkbox</span>
+          <span class="font-mono text-emerald-400 font-semibold block mt-0.5">Anonymous [X]</span>
+        </div>
+      </div>
+
+      <!-- Prominent Koyeb & Cloud Helper Banner -->
+      <div id="cx-helper-banner" class="mt-4 p-3.5 bg-indigo-950/50 border border-indigo-500/30 rounded-xl flex items-start gap-2.5 text-xs text-indigo-200">
+        <svg class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+        <div id="cx-helper-text" class="leading-relaxed">
+          <span class="font-bold text-emerald-300">Important for Koyeb &amp; Cloud WebDAV:</span> In CX File Explorer, ensure <span class="bg-indigo-900/90 text-emerald-300 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">Anonymous [X]</span> is checked (no username or password required) and Path is set to <span class="bg-indigo-900/90 text-indigo-200 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">/dav</span>. Port is <span class="font-mono text-white font-semibold">443</span> with <span class="font-mono text-emerald-400 font-semibold">HTTPS (ON)</span>.
         </div>
       </div>
     </section>
@@ -159,14 +173,31 @@
   </div>
 
   <script>
-    const currentBaseUrl = window.location.origin;
+    const isKoyebHost = window.location.hostname.endsWith(".koyeb.app") || window.location.hostname.includes("koyeb.app");
+    const currentBaseUrl = (isKoyebHost && window.location.protocol === "http:") ? `https://${window.location.host}` : window.location.origin;
 
     // Initialize CX Explorer config values
     document.addEventListener("DOMContentLoaded", () => {
       const url = new URL(window.location.href);
+      const isKoyeb = url.hostname.endsWith(".koyeb.app") || url.hostname.includes("koyeb.app");
+      const isHttps = url.protocol === "https:" || isKoyeb;
+
       document.getElementById("cx-host").textContent = url.hostname;
-      document.getElementById("cx-port").textContent = url.port || (url.protocol === "https:" ? "443" : "80");
-      document.getElementById("cx-encryption").textContent = url.protocol === "https:" ? "HTTPS (ON)" : "HTTP (OFF)";
+      document.getElementById("cx-port").textContent = isKoyeb ? "443" : (url.port || (isHttps ? "443" : "80"));
+
+      const encEl = document.getElementById("cx-encryption");
+      if (encEl) {
+        encEl.textContent = isHttps ? "HTTPS (ON)" : "HTTP (OFF)";
+        encEl.className = isHttps ? "font-mono text-emerald-400 font-semibold block mt-0.5" : "font-mono text-slate-400 font-semibold block mt-0.5";
+      }
+
+      if (isKoyeb) {
+        const helperText = document.getElementById("cx-helper-text");
+        if (helperText) {
+          helperText.innerHTML = '<span class="font-bold text-amber-300">Koyeb Cloud Active:</span> In CX File Explorer, ensure <span class="bg-indigo-900/90 text-emerald-300 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">Anonymous [X]</span> is checked (no username/password needed) and Path is set to <span class="bg-indigo-900/90 text-indigo-200 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">/dav</span>. Port is <span class="font-mono text-white font-semibold">443</span> with <span class="font-mono text-emerald-400 font-semibold">HTTPS (ON)</span>.';
+        }
+      }
+
       loadMounts();
       fetchStatus();
       setInterval(fetchStatus, 3000);
@@ -291,6 +322,15 @@
     function copyToClipboard(text) {
       navigator.clipboard.writeText(text);
       alert("Copied to clipboard!");
+    }
+
+    function copyHostOnly() {
+      const url = new URL(window.location.href);
+      navigator.clipboard.writeText(url.hostname);
+      const btnText = document.getElementById("copy-host-btn-text");
+      const orig = btnText.textContent;
+      btnText.textContent = "Host Copied!";
+      setTimeout(() => { btnText.textContent = orig; }, 2000);
     }
 
     function copyDavUrl() {

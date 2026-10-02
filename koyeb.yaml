@@ -1,0 +1,69 @@
+# Koyeb Application & Service Deployment Specification
+# CloudStream WebDAV Bridge - High-Speed Cloud-to-Cloud Streaming Proxy
+# Optimized for Koyeb Free Nano Instance (0.1 vCPU, 512MB RAM, Frankfurt fra region)
+#
+# Deployment Options:
+# 1. Koyeb CLI (Declarative Compose):
+#      koyeb compose koyeb.yaml
+# 2. Koyeb CLI (Direct Service Init):
+#      koyeb app init cloud-stream-bridge \
+#        --git github.com/<org-or-user>/cloud-stream-bridge \
+#        --git-branch main \
+#        --git-builder docker \
+#        --instance-type nano \
+#        --regions fra \
+#        --ports 8000:http \
+#        --routes /:8000 \
+#        --checks 8000:http:/health \
+#        --env PORT=8000
+# 3. Koyeb Web Console:
+#      - Source: GitHub repo (main branch)
+#      - Builder: Dockerfile
+#      - Instance: Nano (Free)
+#      - Region: Frankfurt (fra)
+#      - Exposed Port: 8000 (HTTP, Route: /)
+#      - Health Check: HTTP /health (Port: 8000, Method: GET, Grace Period: 15s)
+
+app:
+  name: cloud-stream-bridge
+
+services:
+  - name: cloud-stream-bridge
+    definition:
+      name: cloud-stream-bridge
+      type: WEB
+      regions:
+        - fra
+      instance_types:
+        - scopes: ['region:fra']
+          type: nano
+      scalings:
+        - scopes: ['region:fra']
+          min: 1
+          max: 1
+      ports:
+        - port: 8000
+          protocol: http
+      routes:
+        - port: 8000
+          path: "/"
+      health_checks:
+        - http:
+            port: 8000
+            path: /health
+            method: GET
+          grace_period: 15
+          interval: 30
+          timeout: 5
+          restart_limit: 3
+      env:
+        - key: PORT
+          value: "8000"
+        - key: PYTHONUNBUFFERED
+          value: "1"
+        - key: MAX_CACHE_SIZE_MB
+          value: "50"
+      git:
+        branch: main
+        docker:
+          dockerfile: Dockerfile

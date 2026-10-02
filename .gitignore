@@ -11,3 +11,4 @@ mounts.json
 
 .agentic_workspace/
 repomix-output.xml
+.bin/
