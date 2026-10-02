@@ -1,0 +1,65 @@
+{
+  "output": {
+    "filePath": "repomix-output.xml",
+    "style": "xml",
+    "compress": true,
+    "showLineNumbers": false,
+    "removeComments": false,
+    "removeEmptyLines": true,
+    "topFiles": [
+      "requirements.txt",
+      "Dockerfile",
+      "context.md",
+      "context/architecture-map.md",
+      "context/invariants.md",
+      "context/api-contracts.md",
+      "context/file-responsibilities.md",
+      "context/project-state.md",
+      "main.py",
+      "webdav_engine.py",
+      "range_proxy.py",
+      "stream_probe.py",
+      "templates/index.html"
+    ]
+  },
+  "include": [
+    "Dockerfile",
+    "requirements.txt",
+    "context.md",
+    "context/**/*.md",
+    "main.py",
+    "webdav_engine.py",
+    "range_proxy.py",
+    "stream_probe.py",
+    "standalone_server.py",
+    "colab_run.py",
+    "generate_colab_cell.py",
+    "hf_zero_touch_deployer.py",
+    "start_tunnel.ps1",
+    "run_colab_cell.ps1",
+    "run_bridge.bat",
+    "templates/index.html",
+    "tests/test_webdav.py",
+    "tests/verify_cx.py"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      ".agents/**",
+      ".agentic_workspace/**",
+      "reports/**",
+      "local_tunnel.log",
+      "*.log",
+      "baseline-repomix.xml",
+      "repomix-output.xml",
+      "test_*.py",
+      "mounts.json",
+      "CloudStream_Bridge.ipynb",
+      "__pycache__/**",
+      "tests/__pycache__/**",
+      "*.pyc",
+      "*.tmp"
+    ]
+  }
+}

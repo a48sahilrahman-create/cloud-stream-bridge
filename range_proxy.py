@@ -63,7 +63,6 @@ def parse_byte_range(range_header: Optional[str], total_size: int) -> Tuple[int,
 
     if total_size > 0:
         end = min(end, total_size - 1)
-        start = min(start, end)
 
     return start, end
 
@@ -81,6 +80,17 @@ async def stream_range_proxy(
     """
     telemetry_stats["total_requests_served"] += 1
     start, end = parse_byte_range(range_header, total_size)
+
+    # RFC 7233 416 Range Not Satisfiable check
+    if total_size > 0 and range_header and start > end:
+        return Response(
+            status_code=416,
+            headers={
+                "Content-Range": f"bytes */{total_size}",
+                "Accept-Ranges": "bytes"
+            }
+        )
+
     content_length = (end - start + 1) if (end >= start and total_size > 0) else None
 
     # Upstream request headers
@@ -110,9 +120,14 @@ async def stream_range_proxy(
 
     async def chunk_generator() -> AsyncGenerator[bytes, None]:
         telemetry_stats["active_streams"] += 1
-        client = httpx.AsyncClient(timeout=30.0, follow_redirects=True, verify=False)
+        # read=None is CRITICAL: video players pause/seek/buffer, so read timeout terminates streams prematurely
+        streaming_timeout = httpx.Timeout(connect=15.0, read=None, write=30.0, pool=30.0)
+        client = httpx.AsyncClient(timeout=streaming_timeout, follow_redirects=True, verify=False)
         try:
             async with client.stream("GET", upstream_url, headers=upstream_req_headers) as resp:
+                if resp.status_code not in (200, 206):
+                    logger.error(f"Upstream returned HTTP {resp.status_code} for range {start}-{end}")
+                    return
                 async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
                     telemetry_stats["total_bytes_streamed"] += len(chunk)
                     yield chunk

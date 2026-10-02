@@ -8,3 +8,6 @@ server.log
 tunnel.log
 mounts.json
 .pytest_cache/
+
+.agentic_workspace/
+repomix-output.xml

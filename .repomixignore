@@ -1,0 +1,54 @@
+# ==============================================================================
+# CloudStream WebDAV Bridge — Anti-Pollution Repomix Exclusion Boundary
+# ==============================================================================
+
+# 1. Ephemeral Agent Workspaces, Swarm Logs & IPC
+.agents/
+.agentic_workspace/
+reports/
+mailbox/
+consensus/
+*.log
+local_tunnel.log
+
+# 2. Binary Media, Container Files & Static Blobs
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.jfif
+*.svg
+*.mp4
+*.mkv
+*.avi
+*.ts
+*.iso
+*.ico
+*.pdf
+
+# 3. Python Virtualenvs, Caches & Bytecode
+__pycache__/
+tests/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+venv/
+.venv/
+env/
+
+# 4. Scratch & Ad-hoc Debug Scripts (Canonical suites in tests/ preserved)
+test_*.py
+tests/*.log
+tests/*.json
+
+# 5. Transient Database State & Notebook Scratch
+mounts.json
+CloudStream_Bridge.ipynb
+.ipynb_checkpoints/
+
+# 6. Repomix Output Self-Exclusion & Temp Files
+repomix-output.xml
+baseline-repomix.xml
+*.tmp

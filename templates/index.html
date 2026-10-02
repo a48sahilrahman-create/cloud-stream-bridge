@@ -197,7 +197,7 @@
 
         container.innerHTML = data.mounts.map(m => {
           const davFileUrl = `${currentBaseUrl}/dav/${encodeURIComponent(m.filename)}`;
-          const vlcIntent = `vlc://${davFileUrl}`;
+          const androidIntent = `intent:${davFileUrl.replace(/^https?:\/\//, "https://")}#Intent;action=android.intent.action.VIEW;type=video/*;end`;
           return `
             <div class="py-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
               <div class="space-y-1 max-w-xl">
@@ -214,11 +214,14 @@
                 </div>
               </div>
               <div class="flex items-center flex-wrap gap-2 text-xs">
-                <button onclick="copyToClipboard('${davFileUrl}')" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-2.5 py-1.5 rounded-lg border border-slate-700 transition">
-                  Copy DAV Link
+                <button onclick="copyToClipboard('${davFileUrl}')" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-2.5 py-1.5 rounded-lg border border-slate-700 transition" title="Copy Direct HTTPS URL for VLC Network Stream">
+                  Copy Stream URL
                 </button>
-                <a href="${vlcIntent}" class="bg-orange-600 hover:bg-orange-500 text-white px-2.5 py-1.5 rounded-lg font-medium shadow-sm transition flex items-center gap-1">
-                  <span>Open in VLC</span>
+                <a href="${davFileUrl}" target="_blank" class="bg-indigo-600 hover:bg-indigo-500 text-white px-2.5 py-1.5 rounded-lg font-medium shadow-sm transition flex items-center gap-1" title="Stream directly via HTTPS">
+                  <span>Direct Stream</span>
+                </a>
+                <a href="${androidIntent}" class="bg-orange-600 hover:bg-orange-500 text-white px-2.5 py-1.5 rounded-lg font-medium shadow-sm transition flex items-center gap-1" title="Launch Android Video Player / VLC">
+                  <span>VLC App</span>
                 </a>
                 <button onclick="openQrModal('${davFileUrl}')" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-1.5 rounded-lg border border-slate-700 transition" title="Show QR Code">
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg>

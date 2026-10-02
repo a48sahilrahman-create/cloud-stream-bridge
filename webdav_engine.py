@@ -12,6 +12,7 @@ import time
 import os
 import json
 import email.utils
+from urllib.parse import unquote
 from typing import Dict, Any, Optional
 from starlette.requests import Request
 from starlette.responses import Response, PlainTextResponse
@@ -199,8 +200,9 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
     # 2. PROPFIND Method (Directory & File Metadata Listing)
     if method == "PROPFIND":
         if path:
-            filename = path.split("/")[-1]
-            mount = mount_manager.get_by_filename(filename)
+            raw_filename = path.split("/")[-1]
+            filename = unquote(raw_filename)
+            mount = mount_manager.get_by_filename(filename) or mount_manager.get_by_filename(raw_filename)
             if not mount:
                 return PlainTextResponse(f"File '{filename}' not found on WebDAV bridge.", status_code=404)
             xml_resp = build_propfind_xml(base_dav_path, target_file=mount)
@@ -224,8 +226,9 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
         # Requesting root /dav/ with GET or HEAD
         return PlainTextResponse("CloudStream WebDAV Bridge Active. Connect via CX File Explorer.", status_code=200)
 
-    filename = path.split("/")[-1]
-    mount = mount_manager.get_by_filename(filename)
+    raw_filename = path.split("/")[-1]
+    filename = unquote(raw_filename)
+    mount = mount_manager.get_by_filename(filename) or mount_manager.get_by_filename(raw_filename)
 
     if not mount:
         return PlainTextResponse(f"File '{filename}' not found on WebDAV bridge.", status_code=404)
