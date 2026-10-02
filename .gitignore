@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+local_tunnel.log
+server.log
+tunnel.log
+mounts.json
+.pytest_cache/

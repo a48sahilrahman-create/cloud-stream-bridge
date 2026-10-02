@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CloudStream WebDAV Bridge</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%236366f1'><path d='M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM10 17l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z'/></svg>">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <style>
+    @keyframes pulse-subtle { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .animate-subtle { animation: pulse-subtle 2s infinite ease-in-out; }
+    body { background-color: #0b0f19; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  </style>
+</head>
+<body class="text-slate-100 min-h-screen p-4 sm:p-6 lg:p-8">
+  <div class="max-w-5xl mx-auto space-y-6">
+
+    <!-- Top Navigation & Hero Banner -->
+    <header class="flex flex-col sm:flex-row items-start sm:items-center justify-between pb-6 border-b border-slate-800 gap-4">
+      <div class="flex items-center space-x-3">
+        <div class="w-11 h-11 rounded-xl bg-gradient-to-tr from-indigo-600 to-cyan-400 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+          <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+        </div>
+        <div>
+          <h1 class="text-xl sm:text-2xl font-bold bg-gradient-to-r from-white via-slate-200 to-indigo-300 bg-clip-text text-transparent">
+            CloudStream WebDAV Bridge
+          </h1>
+          <p class="text-xs sm:text-sm text-slate-400">Watch 100 GB Remuxes on 50 Mbps Wi-Fi • 0 Bytes Local Disk</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-2 text-xs bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-full font-medium">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+        <span>Bridge Active & Ready</span>
+      </div>
+    </header>
+
+    <!-- Bandwidth Savings Telemetry -->
+    <section class="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
+      <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-400 font-medium">Virtual Library Size</div>
+        <div id="stat-virtual" class="text-xl sm:text-2xl font-bold text-indigo-400 mt-1">0.0 GB</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Mounted cloud data</div>
+      </div>
+      <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-400 font-medium">Home Wi-Fi Consumed</div>
+        <div id="stat-streamed" class="text-xl sm:text-2xl font-bold text-cyan-400 mt-1">0.0 MB</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Only chunks you watched</div>
+      </div>
+      <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-400 font-medium">Home Bandwidth Saved</div>
+        <div id="stat-saved" class="text-xl sm:text-2xl font-bold text-emerald-400 mt-1">0.0 GB</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Spared from download</div>
+      </div>
+      <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-400 font-medium">Active Streams</div>
+        <div id="stat-streams" class="text-xl sm:text-2xl font-bold text-purple-400 mt-1">0</div>
+        <div class="text-[10px] text-slate-500 mt-0.5">Live seeking sockets</div>
+      </div>
+    </section>
+
+    <!-- Main Mounting Card -->
+    <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 sm:p-6 shadow-xl space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-base sm:text-lg font-semibold text-white">Mount Massive Movie Link</h2>
+          <p class="text-xs text-slate-400">Paste any direct download or CDN stream link. The cloud probes it in &lt;100ms.</p>
+        </div>
+      </div>
+
+      <form id="mount-form" class="space-y-3">
+        <div class="space-y-1">
+          <label class="text-xs font-medium text-slate-300">100 GB Movie Link (MKV / MP4 / Remux / CDN)</label>
+          <input id="stream-url" type="url" required placeholder="https://example.com/movies/Oppenheimer.2023.UHD.Remux.mkv"
+            class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition">
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div class="sm:col-span-2 space-y-1">
+            <label class="text-xs font-medium text-slate-300">Custom Title (Optional)</label>
+            <input id="stream-title" type="text" placeholder="e.g. Oppenheimer (4K UHD Remux)"
+              class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition">
+          </div>
+          <div class="flex items-end">
+            <button id="mount-btn" type="submit"
+              class="w-full bg-gradient-to-r from-indigo-600 to-cyan-500 hover:from-indigo-500 hover:to-cyan-400 text-white font-semibold text-sm py-2.5 px-4 rounded-xl shadow-lg shadow-indigo-600/20 flex items-center justify-center space-x-2 transition disabled:opacity-50">
+              <svg id="btn-icon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+              <span id="btn-text">Mount Virtual WebDAV (<100ms)</span>
+            </button>
+          </div>
+        </div>
+      </form>
+
+      <!-- Mount Status Notice -->
+      <div id="mount-feedback" class="hidden p-3 rounded-xl text-xs border"></div>
+    </section>
+
+    <!-- CX File Explorer Quick Connection Card -->
+    <section class="bg-gradient-to-br from-indigo-950/40 via-slate-900 to-slate-900 border border-indigo-500/20 rounded-2xl p-5 sm:p-6 shadow-xl">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-800 gap-3">
+        <div>
+          <h2 class="text-base sm:text-lg font-semibold text-indigo-200 flex items-center gap-2">
+            <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>
+            CX File Explorer WebDAV Configuration (Android TV / Phone)
+          </h2>
+          <p class="text-xs text-slate-400">Open CX File Explorer &gt; Network &gt; New Location (+) &gt; Remote &gt; WebDAV</p>
+        </div>
+        <button onclick="copyDavUrl()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition flex items-center gap-1.5 self-start sm:self-auto">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"></path></svg>
+          <span id="copy-btn-text">Copy Full WebDAV URL</span>
+        </button>
+      </div>
+
+      <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-4 text-xs">
+        <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800">
+          <span class="text-slate-400 block text-[11px]">Host / Server</span>
+          <span id="cx-host" class="font-mono text-slate-200 font-semibold truncate block mt-0.5">...</span>
+        </div>
+        <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800">
+          <span class="text-slate-400 block text-[11px]">Path</span>
+          <span class="font-mono text-indigo-300 font-semibold block mt-0.5">/dav</span>
+        </div>
+        <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800">
+          <span class="text-slate-400 block text-[11px]">Port</span>
+          <span id="cx-port" class="font-mono text-slate-200 font-semibold block mt-0.5">443</span>
+        </div>
+        <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800">
+          <span class="text-slate-400 block text-[11px]">Encryption</span>
+          <span id="cx-encryption" class="font-mono text-emerald-400 font-semibold block mt-0.5">HTTPS (ON)</span>
+        </div>
+        <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800 col-span-2 sm:col-span-1">
+          <span class="text-slate-400 block text-[11px]">Auth</span>
+          <span class="font-mono text-slate-300 block mt-0.5">Anonymous / admin</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Active Mounted Movies List -->
+    <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 sm:p-6 shadow-xl space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-base sm:text-lg font-semibold text-white">Active Mounted Streams</h2>
+        <button onclick="loadMounts()" class="text-xs text-indigo-400 hover:text-indigo-300 transition">Refresh List</button>
+      </div>
+      <div id="mounts-list" class="divide-y divide-slate-800 text-sm">
+        <div class="py-8 text-center text-slate-500 text-xs">No streams mounted yet. Paste a link above to start.</div>
+      </div>
+    </section>
+
+    <!-- QR Code Modal / Popup -->
+    <div id="qr-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+      <div class="bg-slate-900 border border-slate-700 rounded-2xl p-6 max-w-sm w-full space-y-4 text-center">
+        <h3 class="text-base font-bold text-white">Scan with Phone / TV</h3>
+        <p class="text-xs text-slate-400">Scan to open or send stream directly to your mobile player</p>
+        <div id="qrcode" class="p-3 bg-white rounded-xl inline-block mx-auto"></div>
+        <div id="qr-url-text" class="text-[11px] font-mono text-slate-400 break-all"></div>
+        <button onclick="closeQrModal()" class="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 py-2 rounded-xl text-xs font-semibold">Close</button>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const currentBaseUrl = window.location.origin;
+
+    // Initialize CX Explorer config values
+    document.addEventListener("DOMContentLoaded", () => {
+      const url = new URL(window.location.href);
+      document.getElementById("cx-host").textContent = url.hostname;
+      document.getElementById("cx-port").textContent = url.port || (url.protocol === "https:" ? "443" : "80");
+      document.getElementById("cx-encryption").textContent = url.protocol === "https:" ? "HTTPS (ON)" : "HTTP (OFF)";
+      loadMounts();
+      fetchStatus();
+      setInterval(fetchStatus, 3000);
+    });
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch("/api/status");
+        if (res.ok) {
+          const data = await res.json();
+          document.getElementById("stat-virtual").textContent = `${data.total_virtual_library_gb} GB`;
+          document.getElementById("stat-streamed").textContent = `${data.streamed_mb} MB`;
+          document.getElementById("stat-saved").textContent = `${data.home_bandwidth_saved_gb} GB`;
+          document.getElementById("stat-streams").textContent = data.active_streams;
+        }
+      } catch (e) {}
+    }
+
+    async function loadMounts() {
+      try {
+        const res = await fetch("/api/mounts");
+        const data = await res.json();
+        const container = document.getElementById("mounts-list");
+        if (!data.mounts || data.mounts.length === 0) {
+          container.innerHTML = '<div class="py-8 text-center text-slate-500 text-xs">No streams mounted yet. Paste a link above to start.</div>';
+          return;
+        }
+
+        container.innerHTML = data.mounts.map(m => {
+          const davFileUrl = `${currentBaseUrl}/dav/${encodeURIComponent(m.filename)}`;
+          const vlcIntent = `vlc://${davFileUrl}`;
+          return `
+            <div class="py-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div class="space-y-1 max-w-xl">
+                <div class="flex items-center space-x-2">
+                  <span class="px-2 py-0.5 bg-indigo-900/60 border border-indigo-700/50 text-indigo-300 text-[10px] font-bold rounded-md uppercase tracking-wider">
+                    ${m.content_type.includes("matroska") ? "MKV 4K" : "MP4"}
+                  </span>
+                  <span class="font-semibold text-slate-200 text-sm truncate">${m.title || m.filename}</span>
+                </div>
+                <div class="text-xs text-slate-400 flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <span class="text-emerald-400 font-medium">Virtual Size: ${m.formatted_size}</span>
+                  <span class="text-slate-600">•</span>
+                  <span class="font-mono text-[11px] text-slate-500 truncate max-w-xs">${m.filename}</span>
+                </div>
+              </div>
+              <div class="flex items-center flex-wrap gap-2 text-xs">
+                <button onclick="copyToClipboard('${davFileUrl}')" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-2.5 py-1.5 rounded-lg border border-slate-700 transition">
+                  Copy DAV Link
+                </button>
+                <a href="${vlcIntent}" class="bg-orange-600 hover:bg-orange-500 text-white px-2.5 py-1.5 rounded-lg font-medium shadow-sm transition flex items-center gap-1">
+                  <span>Open in VLC</span>
+                </a>
+                <button onclick="openQrModal('${davFileUrl}')" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-1.5 rounded-lg border border-slate-700 transition" title="Show QR Code">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg>
+                </button>
+                <button onclick="unmountFile('${encodeURIComponent(m.filename)}')" class="text-rose-400 hover:text-rose-300 p-1.5 transition" title="Unmount">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                </button>
+              </div>
+            </div>
+          `;
+        }).join("");
+      } catch (e) {}
+    }
+
+    // Mount form submit handler
+    document.getElementById("mount-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const urlInput = document.getElementById("stream-url");
+      const titleInput = document.getElementById("stream-title");
+      const btn = document.getElementById("mount-btn");
+      const btnText = document.getElementById("btn-text");
+      const feedback = document.getElementById("mount-feedback");
+
+      btn.disabled = true;
+      btnText.textContent = "Probing <100ms...";
+      feedback.className = "hidden";
+
+      try {
+        const res = await fetch("/api/mount", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: urlInput.value.trim(),
+            title: titleInput.value.trim() || undefined
+          })
+        });
+
+        const data = await res.json();
+        if (res.ok && data.status === "success") {
+          feedback.className = "p-3 rounded-xl text-xs border bg-emerald-950/60 border-emerald-500/30 text-emerald-300 block";
+          feedback.innerHTML = `✓ <strong>Mounted successfully:</strong> ${data.mount.filename} (${data.mount.formatted_size}) ready on WebDAV in ${data.probe.elapsed_ms}ms.`;
+          urlInput.value = "";
+          titleInput.value = "";
+          loadMounts();
+          fetchStatus();
+        } else {
+          feedback.className = "p-3 rounded-xl text-xs border bg-rose-950/60 border-rose-500/30 text-rose-300 block";
+          feedback.innerHTML = `✗ <strong>Mount failed:</strong> ${data.message || "Could not probe stream"}`;
+        }
+      } catch (err) {
+        feedback.className = "p-3 rounded-xl text-xs border bg-rose-950/60 border-rose-500/30 text-rose-300 block";
+        feedback.innerHTML = `✗ <strong>Network error:</strong> ${err.message}`;
+      } finally {
+        btn.disabled = false;
+        btnText.textContent = "Mount Virtual WebDAV (<100ms)";
+      }
+    });
+
+    async function unmountFile(filename) {
+      if (!confirm(`Unmount stream?`)) return;
+      await fetch(`/api/mounts/${filename}`, { method: "DELETE" });
+      loadMounts();
+      fetchStatus();
+    }
+
+    function copyToClipboard(text) {
+      navigator.clipboard.writeText(text);
+      alert("Copied to clipboard!");
+    }
+
+    function copyDavUrl() {
+      const url = `${currentBaseUrl}/dav/`;
+      navigator.clipboard.writeText(url);
+      const btnText = document.getElementById("copy-btn-text");
+      const orig = btnText.textContent;
+      btnText.textContent = "Copied!";
+      setTimeout(() => { btnText.textContent = orig; }, 2000);
+    }
+
+    let qrCodeInstance = null;
+    function openQrModal(url) {
+      document.getElementById("qr-url-text").textContent = url;
+      const qrEl = document.getElementById("qrcode");
+      qrEl.innerHTML = "";
+      qrCodeInstance = new QRCode(qrEl, {
+        text: url,
+        width: 192,
+        height: 192,
+        colorDark: "#0b0f19",
+        colorLight: "#ffffff",
+        correctLevel: QRCode.CorrectLevel.M
+      });
+      document.getElementById("qr-modal").classList.remove("hidden");
+    }
+
+    function closeQrModal() {
+      document.getElementById("qr-modal").classList.add("hidden");
+    }
+  </script>
+</body>
+</html>
