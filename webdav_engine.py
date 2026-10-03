@@ -16,7 +16,7 @@ import email.utils
 from xml.sax.saxutils import escape
 from typing import Dict, Any, Optional
 from starlette.requests import Request
-from starlette.responses import Response, PlainTextResponse
+from starlette.responses import Response, PlainTextResponse, RedirectResponse
 from range_proxy import stream_range_proxy
 
 def xml_escape(val: Any) -> str:
@@ -24,25 +24,36 @@ def xml_escape(val: Any) -> str:
     return escape(str(val), {'"': "&quot;", "'": "&apos;"})
 
 # Mount registry store
-MOUNTS_DB_PATH = os.path.join(os.path.dirname(__file__), "mounts.json")
+MOUNTS_DB_PATH = os.environ.get("MOUNTS_DB_PATH", os.path.join(os.path.dirname(__file__), "mounts.json"))
 
 
 class MountManager:
-    def __init__(self):
+    def __init__(self, db_path: Optional[str] = None):
         self.mounts: Dict[str, Dict[str, Any]] = {}
+        self.db_path = db_path
         self.load()
 
-    def load(self):
-        if os.path.exists(MOUNTS_DB_PATH):
+    def get_path(self) -> str:
+        return self.db_path or os.environ.get("MOUNTS_DB_PATH", MOUNTS_DB_PATH)
+
+    def load(self, path: Optional[str] = None):
+        target = path or self.get_path()
+        if os.path.exists(target):
             try:
-                with open(MOUNTS_DB_PATH, "r", encoding="utf-8") as f:
+                with open(target, "r", encoding="utf-8") as f:
                     self.mounts = json.load(f)
             except Exception:
                 self.mounts = {}
+        else:
+            self.mounts = {}
 
-    def save(self):
+    def save(self, path: Optional[str] = None):
+        target = path or self.get_path()
         try:
-            with open(MOUNTS_DB_PATH, "w", encoding="utf-8") as f:
+            parent_dir = os.path.dirname(target)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
                 json.dump(self.mounts, f, indent=2)
         except Exception:
             pass
@@ -296,14 +307,34 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
         headers = {
             "Accept-Ranges": "bytes",
             "Content-Type": content_type,
-            "Last-Modified": format_http_date(mount.get("created_at", time.time()))
+            "Last-Modified": format_http_date(mount.get("created_at", time.time())),
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "Location, Content-Range, Accept-Ranges, Content-Length",
+            "Cache-Control": "no-cache, no-store, must-revalidate"
         }
         if total_bytes > 0:
             headers["Content-Length"] = str(total_bytes)
         return Response(status_code=200, headers=headers)
 
-    # 5. GET Method (with Range support)
+    # 5. GET Method (with 302 Redirect Bypass & Range Proxy Fallback)
     if method == "GET":
+        force_proxy = (
+            request.query_params.get("proxy") == "1"
+            or os.environ.get("WEBDAV_DIRECT_REDIRECT") == "0"
+        )
+        if not force_proxy and upstream_url:
+            return RedirectResponse(
+                url=upstream_url,
+                status_code=302,
+                headers={
+                    "Location": upstream_url,
+                    "Accept-Ranges": "bytes",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Expose-Headers": "Location, Content-Range, Accept-Ranges",
+                    "Cache-Control": "no-cache, no-store, must-revalidate"
+                }
+            )
+
         range_header = request.headers.get("Range")
         return await stream_range_proxy(
             upstream_url=upstream_url,
