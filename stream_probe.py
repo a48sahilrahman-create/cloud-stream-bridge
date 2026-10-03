@@ -13,12 +13,12 @@ import re
 from urllib.parse import urlparse, parse_qs, unquote
 from typing import Dict, Any, Optional
 
-PROBE_TIMEOUT = 5.0
+PROBE_TIMEOUT = 8.0
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
 VIDEO_EXTENSIONS = (
     ".mkv", ".mp4", ".ts", ".avi", ".mov", ".webm",
-    ".m4v", ".flv", ".wmv", ".iso", ".mpg", ".mpeg", ".vob"
+    ".m4v", ".flv", ".wmv", ".iso", ".mpg", ".mpeg", ".vob", ".m3u8"
 )
 
 
@@ -117,21 +117,34 @@ def extract_filename(
 
 async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """
-    Probes an upstream stream/download link.
-    Performs targeted Range GET (bytes=0-8191) to verify:
-      1. HTTP 206 Partial Content support
-      2. Container magic bytes
-      3. Total file size
+    Probes an upstream stream/download link with a multi-tier resilience cascade:
+      Tier 1: Range GET (bytes=0-8191) with modern browser headers.
+      Tier 2: Fallback HEAD without Range (if Range GET gets 400, 403, 416, or missing size).
+      Tier 3: Fallback Stream GET without Range (if HEAD gets 405/403 or for container magic bytes).
+    Never raises unhandled exceptions; returns clean metadata dictionary.
     """
     t0 = time.perf_counter()
-    headers = {
+
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if (parsed.scheme and parsed.netloc) else ""
+
+    base_headers = {
         "User-Agent": DEFAULT_USER_AGENT,
         "Accept": "*/*",
         "Accept-Encoding": "identity",
-        "Range": "bytes=0-8191"
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "video",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
     }
+    if origin:
+        base_headers["Referer"] = f"{origin}/"
+        base_headers["Origin"] = origin
     if custom_headers:
-        headers.update(custom_headers)
+        base_headers.update(custom_headers)
 
     client_kwargs = {
         "timeout": PROBE_TIMEOUT,
@@ -139,119 +152,250 @@ async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None
         "verify": False
     }
 
+    status_code = 0
+    content_range = ""
+    content_length = ""
+    content_type = ""
+    accept_ranges = ""
+    final_url = url
+    resp_headers = None
+    data = b""
+    error_msg = None
+
     try:
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            async with client.stream("GET", url, headers=headers) as resp:
-                elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-                status_code = resp.status_code
-                content_range = resp.headers.get("content-range", "")
-                content_length = resp.headers.get("content-length", "")
-                content_type = resp.headers.get("content-type", "").lower()
-                final_url = str(resp.url)
-                resp_headers = resp.headers
+        # -------------------------------------------------------------
+        # Tier 1: Range GET (bytes=0-8191) with browser headers
+        # -------------------------------------------------------------
+        tier1_headers = dict(base_headers)
+        tier1_headers["Range"] = "bytes=0-8191"
+        tier1_ok = False
 
-                # Read first 8KB of data
-                data = b""
-                async for chunk in resp.aiter_bytes():
-                    data += chunk
-                    if len(data) >= 8192:
-                        break
+        try:
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                async with client.stream("GET", url, headers=tier1_headers) as resp:
+                    status_code = resp.status_code
+                    final_url = str(resp.url)
+                    resp_headers = resp.headers
+                    content_range = resp.headers.get("content-range", "")
+                    content_length = resp.headers.get("content-length", "")
+                    content_type = resp.headers.get("content-type", "").lower()
+                    accept_ranges = resp.headers.get("accept-ranges", "").lower()
 
-            # Parse total size
-            total_bytes = 0
-            range_supported = (status_code == 206) or ("bytes" in resp.headers.get("accept-ranges", "").lower())
+                    if status_code in (200, 206):
+                        async for chunk in resp.aiter_bytes():
+                            data += chunk
+                            if len(data) >= 8192:
+                                break
+                        tier1_ok = True
+                    else:
+                        error_msg = f"Tier 1 Range GET returned HTTP {status_code}"
+        except Exception as e:
+            error_msg = f"Tier 1 Range GET failed: {e}"
 
-            if content_range and "/" in content_range:
-                try:
-                    total_bytes = int(content_range.split("/")[-1])
-                    range_supported = True
-                except ValueError:
-                    pass
-            elif content_length and content_length.isdigit() and status_code == 200:
+        # -------------------------------------------------------------
+        # Tier 2: Fallback HEAD without Range header
+        # Triggered if Tier 1 hit 400, 403, 416, non-200/206, or missing size
+        # -------------------------------------------------------------
+        need_tier2 = (
+            (not tier1_ok) or
+            (status_code in (400, 403, 416)) or
+            (not content_range and not content_length)
+        )
+        tier2_ok = False
+        head_status_code = 0
+
+        if need_tier2:
+            head_headers = dict(base_headers)
+            head_headers.pop("Range", None)
+            try:
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    head_resp = await client.head(url, headers=head_headers)
+                    head_status_code = head_resp.status_code
+                    if head_status_code in (200, 206):
+                        status_code = head_status_code
+                        final_url = str(head_resp.url)
+                        resp_headers = head_resp.headers
+                        h_len = head_resp.headers.get("content-length", "")
+                        if h_len and h_len.isdigit():
+                            content_length = h_len
+                        h_ct = head_resp.headers.get("content-type", "")
+                        if h_ct:
+                            content_type = h_ct.lower()
+                        h_ar = head_resp.headers.get("accept-ranges", "")
+                        if h_ar:
+                            accept_ranges = h_ar.lower()
+                        tier2_ok = True
+                        error_msg = None
+                    else:
+                        if not tier1_ok:
+                            status_code = head_status_code
+                            resp_headers = head_resp.headers
+                            error_msg = f"Tier 2 HEAD returned HTTP {head_status_code}"
+            except Exception as e:
+                if not tier1_ok:
+                    error_msg = f"Tier 2 HEAD failed: {e}"
+
+        # -------------------------------------------------------------
+        # Tier 3: Stream GET without Range header (read first 8KB, then close stream)
+        # Triggered if HEAD is rejected with 405 Method Not Allowed or 403,
+        # or if Tier 1 failed and we have no container payload data to detect magic bytes.
+        # -------------------------------------------------------------
+        need_tier3 = False
+        if not tier1_ok:
+            if head_status_code in (405, 403, 400) or not tier2_ok or len(data) == 0:
+                need_tier3 = True
+
+        if need_tier3:
+            stream_headers = dict(base_headers)
+            stream_headers.pop("Range", None)
+            try:
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    async with client.stream("GET", url, headers=stream_headers) as resp:
+                        stream_code = resp.status_code
+                        if stream_code in (200, 206) or not (tier1_ok or tier2_ok):
+                            status_code = stream_code
+                            final_url = str(resp.url)
+                            resp_headers = resp.headers
+                            s_len = resp.headers.get("content-length", "")
+                            if s_len and s_len.isdigit() and not content_length:
+                                content_length = s_len
+                            s_ct = resp.headers.get("content-type", "")
+                            if s_ct and not content_type:
+                                content_type = s_ct.lower()
+                            s_ar = resp.headers.get("accept-ranges", "")
+                            if s_ar and not accept_ranges:
+                                accept_ranges = s_ar.lower()
+
+                        if stream_code in (200, 206):
+                            data = b""
+                            async for chunk in resp.aiter_bytes():
+                                data += chunk
+                                if len(data) >= 8192:
+                                    break
+                            error_msg = None
+                        elif not (tier1_ok or tier2_ok):
+                            error_msg = f"Tier 3 Stream GET returned HTTP {stream_code}"
+            except Exception as e:
+                if not (tier1_ok or tier2_ok):
+                    error_msg = f"Tier 3 Stream GET failed: {e}"
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+
+        # Parse total size
+        total_bytes = 0
+        if content_range and "/" in content_range:
+            try:
+                total_bytes = int(content_range.split("/")[-1])
+            except ValueError:
+                pass
+        elif content_length and content_length.isdigit():
+            try:
                 total_bytes = int(content_length)
+            except ValueError:
+                pass
 
-            # Fallback HEAD request if range was rejected or size is missing
-            if total_bytes == 0 and status_code in [200, 206]:
-                try:
-                    async with httpx.AsyncClient(**client_kwargs) as client:
-                        head_resp = await client.head(url, headers={"User-Agent": DEFAULT_USER_AGENT})
-                        if head_resp.status_code in [200, 206]:
-                            h_len = head_resp.headers.get("content-length", "")
-                            if h_len and h_len.isdigit():
-                                total_bytes = int(h_len)
-                            if "bytes" in head_resp.headers.get("accept-ranges", "").lower():
-                                range_supported = True
-                except Exception:
-                    pass
+        # Optimistic streaming capability:
+        # If total_bytes == 0 or range is not explicitly advertised, mark range_supported = True
+        # because many modern CDNs support range requests even if Accept-Ranges header is omitted.
+        if (status_code == 206) or ("bytes" in accept_ranges) or (total_bytes == 0) or (accept_ranges != "none"):
+            range_supported = True
+        else:
+            range_supported = False
 
-            # Detect container format
-            is_mkv = data.startswith(b'\x1a\x45\xdf\xa3')
-            is_mp4 = (
-                (len(data) >= 8 and data[4:8] == b'ftyp') or
-                (b'moov' in data[:8192]) or
-                (b'mdat' in data[:8192] and any(a in data[:8192] for a in [b'ftyp', b'wide', b'free', b'skip']))
-            )
-            is_ts = data.startswith(b'\x47') or ("video/mp2t" in content_type)
-            is_avi = data.startswith(b'RIFF') and (b'AVI ' in data[:16])
+        # Container & filename detection
+        is_m3u8_url = (".m3u8" in url.lower()) or (".m3u8" in final_url.lower())
+        is_m3u8_ct = any(x in content_type for x in ["mpegurl", "m3u8"])
+        is_m3u8_data = data.startswith(b"#EXTM3U") or (b"#EXT-X-STREAM-INF" in data) or (b"#EXT-X-TARGETDURATION" in data)
+        is_hls = is_m3u8_url or is_m3u8_ct or is_m3u8_data
 
-            if is_mkv:
-                container_format = "MKV (Matroska / 4K UHD Remux)"
-                mime = "video/x-matroska"
-                ext = ".mkv"
-            elif is_mp4:
-                container_format = "MP4 (ISOBMFF / H.264 / HEVC)"
+        is_mkv = data.startswith(b'\x1a\x45\xdf\xa3')
+        is_mp4 = (
+            (len(data) >= 8 and data[4:8] == b'ftyp') or
+            (b'moov' in data[:8192]) or
+            (b'mdat' in data[:8192] and any(a in data[:8192] for a in [b'ftyp', b'wide', b'free', b'skip']))
+        )
+        is_ts = data.startswith(b'\x47') or ("video/mp2t" in content_type)
+        is_avi = data.startswith(b'RIFF') and (b'AVI ' in data[:16])
+
+        if is_hls:
+            container_format = "HLS Stream (m3u8 Playlist)"
+            mime = "application/x-mpegURL"
+            ext = ".m3u8"
+        elif is_mkv:
+            container_format = "MKV (Matroska / 4K UHD Remux)"
+            mime = "video/x-matroska"
+            ext = ".mkv"
+        elif is_mp4:
+            container_format = "MP4 (ISOBMFF / H.264 / HEVC)"
+            mime = "video/mp4"
+            ext = ".mp4"
+        elif is_ts:
+            container_format = "MPEG-TS Stream"
+            mime = "video/mp2t"
+            ext = ".ts"
+        elif is_avi:
+            container_format = "AVI Container"
+            mime = "video/x-msvideo"
+            ext = ".avi"
+        else:
+            url_lower = (final_url or url).lower()
+            if ".mp4" in url_lower:
+                container_format = "MP4 Video Stream"
                 mime = "video/mp4"
                 ext = ".mp4"
-            elif is_ts:
+            elif ".ts" in url_lower:
                 container_format = "MPEG-TS Stream"
                 mime = "video/mp2t"
                 ext = ".ts"
-            elif is_avi:
-                container_format = "AVI Container"
-                mime = "video/x-msvideo"
-                ext = ".avi"
+            elif ".m3u8" in url_lower:
+                container_format = "HLS Stream (m3u8)"
+                mime = "application/x-mpegURL"
+                ext = ".m3u8"
             else:
                 container_format = "Direct Video Stream"
                 mime = content_type if "video" in content_type else "video/x-matroska"
                 ext = ".mkv"
 
-            # Format human-readable size
-            if total_bytes >= 1024**3:
-                formatted_size = f"{round(total_bytes / (1024**3), 2)} GB"
-            elif total_bytes >= 1024**2:
-                formatted_size = f"{round(total_bytes / (1024**2), 2)} MB"
-            else:
-                formatted_size = f"{total_bytes} bytes" if total_bytes > 0 else "Dynamic Stream"
+        # Format human-readable size
+        if total_bytes >= 1024**3:
+            formatted_size = f"{round(total_bytes / (1024**3), 2)} GB"
+        elif total_bytes >= 1024**2:
+            formatted_size = f"{round(total_bytes / (1024**2), 2)} MB"
+        elif total_bytes > 0:
+            formatted_size = f"{total_bytes} bytes"
+        else:
+            formatted_size = "Dynamic Stream"
 
-            # Derive default filename from presigned query params, headers, or URL path
-            url_filename = extract_filename(final_url, resp_headers, ext=ext, fallback_url=url)
+        # Derive default filename from presigned query params, headers, or URL path
+        url_filename = extract_filename(final_url, resp_headers, ext=ext, fallback_url=url)
 
-            is_valid = (status_code in [200, 206]) and (total_bytes > 0 or range_supported)
-            return {
-                "valid": is_valid,
-                "status_code": status_code,
-                "range_supported": range_supported,
-                "container_format": container_format,
-                "content_type": mime,
-                "total_bytes": total_bytes,
-                "formatted_size": formatted_size,
-                "default_filename": url_filename,
-                "final_url": final_url,
-                "elapsed_ms": elapsed_ms,
-                "error": None if is_valid else f"HTTP {status_code} received from upstream server"
-            }
+        is_valid = (status_code in [200, 206])
+        return {
+            "valid": is_valid,
+            "status_code": status_code,
+            "range_supported": range_supported,
+            "container_format": container_format,
+            "content_type": mime,
+            "total_bytes": total_bytes,
+            "formatted_size": formatted_size,
+            "default_filename": url_filename,
+            "final_url": final_url,
+            "elapsed_ms": elapsed_ms,
+            "error": None if is_valid else (error_msg or f"HTTP {status_code} received from upstream server")
+        }
 
     except Exception as e:
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
         return {
             "valid": False,
-            "status_code": 0,
-            "range_supported": False,
-            "container_format": "Unknown",
+            "status_code": status_code or 0,
+            "range_supported": True,
+            "container_format": "Direct Video Stream",
             "content_type": "video/x-matroska",
             "total_bytes": 0,
-            "formatted_size": "Unknown Size",
+            "formatted_size": "Dynamic Stream",
             "default_filename": extract_filename(url, ext=".mkv"),
-            "final_url": url,
-            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
+            "final_url": final_url or url,
+            "elapsed_ms": elapsed_ms,
             "error": str(e)
         }

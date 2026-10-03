@@ -406,6 +406,62 @@ def test_koyeb_cloud_health_checks():
     assert resp_api_404.text == "Not Found"
 
 
+def test_mounts_db_path_env_override(tmp_path, monkeypatch):
+    """
+    Verify MOUNTS_DB_PATH environment variable overrides the default path
+    and mount_manager loads/saves from the persistent path properly.
+    """
+    import json
+    from webdav_engine import mount_manager
+
+    custom_mounts_dir = tmp_path / "custom_dir"
+    custom_mounts_file = custom_mounts_dir / "mounts.json"
+    custom_mounts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-populate custom mounts file
+    sample_data = {
+        "PersistentMovie.mkv": {
+            "id": "m_test_persist",
+            "filename": "PersistentMovie.mkv",
+            "title": "Persistent Movie",
+            "upstream_url": "https://example.com/persist.mkv",
+            "total_bytes": 1024 * 1024 * 1024,
+            "content_type": "video/x-matroska",
+            "formatted_size": "1.0 GB",
+            "created_at": 1000.0,
+            "last_accessed": 1000.0
+        }
+    }
+    with open(custom_mounts_file, "w", encoding="utf-8") as f:
+        json.dump(sample_data, f)
+
+    # Set environment variable and reload mount_manager
+    monkeypatch.setenv("MOUNTS_DB_PATH", str(custom_mounts_file))
+    original_mounts = dict(mount_manager.mounts)
+    try:
+        mount_manager.load()
+        assert "PersistentMovie.mkv" in mount_manager.mounts
+        assert mount_manager.get_by_filename("PersistentMovie.mkv")["title"] == "Persistent Movie"
+
+        # Add a new mount and check it saves to the custom file
+        mount_manager.add_mount(
+            movie_id="m_test_new",
+            filename="NewMovie.mkv",
+            upstream_url="https://example.com/new.mkv",
+            total_bytes=2048,
+            content_type="video/x-matroska",
+            formatted_size="2 KB"
+        )
+        with open(custom_mounts_file, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        assert "NewMovie.mkv" in saved
+    finally:
+        # Restore original state
+        monkeypatch.delenv("MOUNTS_DB_PATH", raising=False)
+        mount_manager.mounts = original_mounts
+        mount_manager.load()
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

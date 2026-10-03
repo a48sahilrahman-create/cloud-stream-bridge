@@ -1,7 +1,7 @@
 """
 CloudStream WebDAV Bridge - FastAPI Main Server
 Exposes Web UI, REST Control APIs, and RFC 4918 Virtual WebDAV Endpoint.
-Designed for 1-Click Zero-Cost Cloud Deployment (Hugging Face Spaces / Render / Local).
+Embedded Android Chaquopy Engine Edition.
 """
 
 import os
@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("cloudstream_main")
 
-from stream_probe import probe_stream
+from stream_probe import probe_stream, extract_filename
 from webdav_engine import handle_webdav_request, mount_manager
 from range_proxy import telemetry_stats
 
@@ -55,7 +55,19 @@ async def root_dispatcher(request: Request):
         index_path = os.path.join(TEMPLATES_DIR, "index.html")
         if os.path.exists(index_path):
             return FileResponse(index_path, media_type="text/html")
-        return HTMLResponse("<h1>CloudStream WebDAV Bridge Active</h1>")
+        return HTMLResponse(
+            "<html><head><title>CloudStream WebDAV Bridge</title></head>"
+            "<body style='font-family:sans-serif;padding:2rem;background:#121212;color:#eee;'>"
+            "<h2>CloudStream WebDAV Bridge Engine Active</h2>"
+            "<p>Android Chaquopy Embedded Server running.</p>"
+            "<ul>"
+            "<li>WebDAV Root: <code>/dav/</code></li>"
+            "<li>Status API: <code>/api/status</code></li>"
+            "<li>Mount API: <code>/api/mount</code> (POST)</li>"
+            "<li>Mounts List: <code>/api/mounts</code> (GET)</li>"
+            "<li>Health Check: <code>/health</code></li>"
+            "</ul></body></html>"
+        )
     return await handle_webdav_request(request, path="")
 
 
@@ -64,39 +76,63 @@ async def api_mount_stream(req: MountRequest, request: Request):
     """
     Probes upstream link in <100ms, detects 4K Remux container/range support,
     and mounts it as a virtual file on WebDAV.
+    Guarantees mounting even if upstream probe fails or returns non-200.
     """
     url = req.url.strip()
     if not url:
         return JSONResponse({"status": "error", "message": "URL cannot be empty"}, status_code=400)
 
-    # 1. Pre-flight probe
-    probe_result = await probe_stream(url, custom_headers=req.custom_headers)
-    if not probe_result["valid"]:
-        return JSONResponse({
-            "status": "error",
-            "message": f"Stream probe failed: {probe_result['error'] or 'Non-200/206 status'}",
-            "details": probe_result
-        }, status_code=422)
+    # 1. Pre-flight probe (never block or 422 if valid is False)
+    try:
+        probe_result = await probe_stream(url, custom_headers=req.custom_headers)
+    except Exception as e:
+        logger.warning(f"Unexpected probe exception for {url}: {e}")
+        probe_result = {
+            "valid": False,
+            "status_code": 0,
+            "range_supported": True,
+            "container_format": "Direct Video Stream",
+            "content_type": "video/x-matroska",
+            "total_bytes": 0,
+            "formatted_size": "Dynamic Stream",
+            "default_filename": extract_filename(url, ext=".mkv"),
+            "final_url": url,
+            "elapsed_ms": 0.0,
+            "error": str(e)
+        }
+
+    # If probe fails, times out, or returns non-200, log a warning, but PROCEED to mount
+    # the stream in dynamic/fallback mode instead of blocking with HTTP 422.
+    is_fallback = not probe_result.get("valid", False)
+    if is_fallback:
+        logger.warning(
+            f"Stream probe warning for {url}: {probe_result.get('error', 'Unknown probe error')}. "
+            "Mounting stream in dynamic/fallback mode."
+        )
 
     # 2. Register virtual mount
-    filename = probe_result["default_filename"]
+    filename = probe_result.get("default_filename") or extract_filename(url) or f"stream_{int(time.time())}.mkv"
+    total_bytes = probe_result.get("total_bytes", 0)
+    content_type = probe_result.get("content_type", "video/x-matroska")
+    formatted_size = probe_result.get("formatted_size") or "Dynamic Stream"
+    upstream_url = probe_result.get("final_url") or url
     title = req.title or filename
     movie_id = f"m_{int(time.time())}"
 
     mount = mount_manager.add_mount(
         movie_id=movie_id,
         filename=filename,
-        upstream_url=probe_result["final_url"],
-        total_bytes=probe_result["total_bytes"],
-        content_type=probe_result["content_type"],
-        formatted_size=probe_result["formatted_size"],
+        upstream_url=upstream_url,
+        total_bytes=total_bytes,
+        content_type=content_type,
+        formatted_size=formatted_size,
         title=title
     )
 
     # Base URL derivation
     base_url = str(request.base_url).rstrip("/")
 
-    return {
+    response_data = {
         "status": "success",
         "mount": mount,
         "probe": probe_result,
@@ -115,6 +151,11 @@ async def api_mount_stream(req: MountRequest, request: Request):
             }
         }
     }
+
+    if is_fallback:
+        response_data["warning"] = f"Stream mounted in fallback mode: {probe_result.get('error')}"
+
+    return response_data
 
 
 @app.get("/api/mounts")
@@ -161,8 +202,8 @@ async def api_status():
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def api_ping():
     """
-    Lightweight health and keep-alive endpoint for cloud hosting daemons.
-    Supports both GET and HEAD requests across Koyeb, Render, Hugging Face, etc.
+    Lightweight health and keep-alive endpoint.
+    Supports both GET and HEAD requests.
     """
     return {
         "status": "online",
@@ -174,9 +215,9 @@ async def api_ping():
 
 async def keep_alive_daemon():
     """
-    Automatic cloud keep-alive daemon:
-    Pings RENDER_EXTERNAL_URL, KOYEB_PUBLIC_DOMAIN, or KEEP_ALIVE_URL every 10 minutes to prevent
-    free-tier inactivity sleep on Render / Koyeb / cloud containers.
+    Cloud keep-alive daemon:
+    Only runs if explicitly configured with an external cloud hosting URL (Render, Koyeb, etc.).
+    Remains dormant in local/Android environments.
     """
     target = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEP_ALIVE_URL")
     if not target and os.environ.get("KOYEB_PUBLIC_DOMAIN"):
@@ -199,7 +240,9 @@ async def keep_alive_daemon():
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(keep_alive_daemon())
+    # Only launch keep-alive daemon if external cloud domain is configured
+    if os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEP_ALIVE_URL") or os.environ.get("KOYEB_PUBLIC_DOMAIN"):
+        asyncio.create_task(keep_alive_daemon())
 
 
 # WebDAV Endpoints (RFC 4918 Virtual Mount)
