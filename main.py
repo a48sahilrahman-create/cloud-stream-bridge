@@ -20,6 +20,7 @@ logger = logging.getLogger("cloudstream_main")
 from stream_probe import probe_stream, extract_filename
 from webdav_engine import handle_webdav_request, mount_manager
 from range_proxy import telemetry_stats
+from central_hub import hub_router, dav_redirect_router, registry
 
 app = FastAPI(
     title="CloudStream WebDAV Bridge",
@@ -230,8 +231,16 @@ async def api_ping():
         "status": "online",
         "service": "cloud-stream-bridge",
         "timestamp": time.time(),
-        "mounted_count": len(mount_manager.list_all())
+        "mounted_count": len(mount_manager.list_all()),
+        "active_users": registry.get_active_count(),
+        "total_registered": registry.get_total_count()
     }
+
+
+# Include Multi-User Central Pointer Hub routes
+# (/api/register, /api/heartbeat/{user_id}, /api/status/{user_id}, /api/mount/{user_id},
+#  /api/unmount/{user_id}/{filename}, /api/unmount-all/{user_id}, /api/hub/users, /api/hub/status)
+app.include_router(hub_router)
 
 
 async def keep_alive_daemon():
@@ -266,17 +275,46 @@ async def startup_event():
         asyncio.create_task(keep_alive_daemon())
 
 
-# WebDAV Endpoints (RFC 4918 Virtual Mount)
+# WebDAV Endpoints (RFC 4918 Virtual Mount & Multi-User Router)
 @app.api_route("/dav", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "DELETE"])
-@app.api_route("/dav/{path:path}", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "DELETE"])
-async def webdav_dispatcher(request: Request, path: str = ""):
-    if not path and request.method == "GET":
+@app.api_route("/dav/", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "DELETE"])
+async def webdav_dispatcher(request: Request):
+    if request.method == "GET":
         accept = request.headers.get("accept", "")
         if "text/html" in accept:
             index_path = os.path.join(TEMPLATES_DIR, "index.html")
             if os.path.exists(index_path):
                 return FileResponse(index_path, media_type="text/html")
-    return await handle_webdav_request(request, path)
+    return await handle_webdav_request(request, "")
+
+
+@app.api_route(
+    "/dav/{user_id}/",
+    methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "MKCOL", "DELETE", "POST", "PUT"],
+)
+@app.api_route(
+    "/dav/{user_id}/{path:path}",
+    methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "MKCOL", "DELETE", "POST", "PUT"],
+)
+async def webdav_user_path_dispatcher(user_id: str, request: Request, path: str = ""):
+    return await dav_redirect_router(user_id=user_id, request=request, path=path)
+
+
+@app.api_route(
+    "/dav/{user_id}",
+    methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "MKCOL", "DELETE", "POST", "PUT"],
+)
+async def webdav_user_single_dispatcher(user_id: str, request: Request):
+    # Standalone mounted file check
+    if mount_manager.get_mount(user_id):
+        return await handle_webdav_request(request, user_id)
+    # Check if this looks like a missing local media file vs a user_id
+    lower_id = user_id.lower()
+    media_exts = (".mkv", ".mp4", ".avi", ".ts", ".mov", ".m4v", ".webm", ".flv", ".iso", ".m3u8", ".mpd")
+    if any(lower_id.endswith(ext) for ext in media_exts) and not registry.is_active(user_id) and not registry.get(user_id):
+        return await handle_webdav_request(request, user_id)
+    # Otherwise treat as multi-user hub root
+    return await dav_redirect_router(user_id=user_id, request=request, path="")
 
 
 # Root Fallback Dispatcher for clients that mount without /dav (e.g. CX File Explorer with empty Path)

@@ -35,7 +35,7 @@ def test_parse_args_defaults(monkeypatch):
 
     args = csr.parse_args([])
     assert args.user == "default"
-    assert args.hub == "https://cloudstream-hub.onrender.com"
+    assert args.hub == "https://cloud-stream-bridge.onrender.com"
     assert args.port == 7860
 
 

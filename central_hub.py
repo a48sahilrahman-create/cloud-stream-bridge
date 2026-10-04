@@ -17,7 +17,7 @@ from urllib.parse import quote
 from xml.sax.saxutils import escape as xml_escape
 
 import httpx
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response, HTTPException, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -137,6 +137,24 @@ class InMemoryUserRegistry:
         with self._lock:
             return len(self._users)
 
+    def get_users(self) -> Dict[str, Dict[str, Any]]:
+        """Return all user records with computed active and TTL status."""
+        with self._lock:
+            now = time.time()
+            res = {}
+            for uid, entry in self._users.items():
+                active = (now - entry["last_seen"]) < entry["ttl_sec"]
+                ttl_remaining = max(0, int(entry["last_seen"] + entry["ttl_sec"] - now)) if active else 0
+                res[uid] = {
+                    "user_id": uid,
+                    "active": active,
+                    "tunnel_url": entry["tunnel_url"] if active else None,
+                    "last_seen": entry["last_seen"],
+                    "ttl_remaining_sec": ttl_remaining,
+                    "registered_at": entry.get("registered_at", entry["last_seen"]),
+                }
+            return res
+
     def remove(self, user_id: str) -> bool:
         """Remove user from registry."""
         with self._lock:
@@ -185,6 +203,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Multi-User API Router for Central Pointer Hub
+hub_router = APIRouter()
+
 
 @app.get("/health")
 @app.get("/")
@@ -199,7 +220,7 @@ async def health_check():
     }
 
 
-@app.post("/api/register")
+@hub_router.post("/api/register")
 async def register_user(payload: RegisterRequest):
     """
     Register or refresh a user's active Cloud Shell tunnel.
@@ -219,7 +240,21 @@ async def register_user(payload: RegisterRequest):
     }
 
 
-@app.get("/api/status/{user_id}")
+@hub_router.api_route("/api/heartbeat/{user_id}", methods=["GET", "POST"])
+async def api_heartbeat(user_id: str):
+    """
+    Heartbeat keep-alive endpoint refreshing last_seen timestamp for active user session.
+    """
+    uid = user_id.strip()
+    is_active = registry.touch(uid)
+    status_info = registry.get_status(uid)
+    return {
+        "status": "alive" if is_active else "dormant",
+        **status_info,
+    }
+
+
+@hub_router.get("/api/status/{user_id}")
 async def get_user_status(user_id: str):
     """
     Get active status and remaining TTL for a user.
@@ -228,7 +263,30 @@ async def get_user_status(user_id: str):
     return registry.get_status(user_id.strip())
 
 
-@app.post("/api/mount/{user_id}")
+@hub_router.get("/api/hub/users")
+async def get_hub_users():
+    """Returns list of registered users and their status."""
+    return {
+        "status": "success",
+        "active_users": registry.get_active_count(),
+        "total_registered": registry.get_total_count(),
+        "users": registry.get_users(),
+    }
+
+
+@hub_router.get("/api/hub/status")
+async def get_hub_status():
+    """Returns central pointer hub telemetry and health status."""
+    return {
+        "status": "healthy",
+        "service": "cloudstream-central-hub",
+        "active_users": registry.get_active_count(),
+        "total_registered": registry.get_total_count(),
+        "timestamp": time.time(),
+    }
+
+
+@hub_router.post("/api/mount/{user_id}")
 async def forward_mount_request(user_id: str, payload: MountRequest):
     """
     Forwards a stream mount request to the user's active Google Cloud Shell backend.
@@ -286,7 +344,7 @@ async def forward_mount_request(user_id: str, payload: MountRequest):
         )
 
 
-@app.get("/api/mounts/{user_id}")
+@hub_router.get("/api/mounts/{user_id}")
 async def get_user_mounts(user_id: str):
     """
     Retrieves the list of active mounted streams from user's Cloud Shell instance.
@@ -312,7 +370,9 @@ async def get_user_mounts(user_id: str):
         )
 
 
-@app.delete("/api/mounts/{user_id}/{filename:path}")
+@hub_router.delete("/api/mounts/{user_id}/{filename:path}")
+@hub_router.delete("/api/unmount/{user_id}/{filename:path}")
+@hub_router.post("/api/unmount/{user_id}/{filename:path}")
 async def forward_unmount_request(user_id: str, filename: str):
     """
     Forwards an unmount request for a specific file to user's Cloud Shell.
@@ -336,7 +396,7 @@ async def forward_unmount_request(user_id: str, filename: str):
         return JSONResponse(status_code=502, content={"error": f"Failed to unmount: {str(exc)}", "status": "error"})
 
 
-@app.post("/api/unmount/{user_id}")
+@hub_router.post("/api/unmount/{user_id}")
 async def forward_unmount_post_request(user_id: str, payload: UnmountRequest):
     """
     Forwards a JSON-based unmount request for a specific file to user's Cloud Shell.
@@ -344,8 +404,9 @@ async def forward_unmount_post_request(user_id: str, payload: UnmountRequest):
     return await forward_unmount_request(user_id=user_id, filename=payload.filename)
 
 
-@app.delete("/api/mounts/{user_id}")
-@app.post("/api/unmount-all/{user_id}")
+@hub_router.delete("/api/mounts/{user_id}")
+@hub_router.delete("/api/unmount-all/{user_id}")
+@hub_router.post("/api/unmount-all/{user_id}")
 async def forward_unmount_all_request(user_id: str):
     """
     Forwards a batch unmount-all request to wipe all mounted files in user's Cloud Shell.
@@ -366,6 +427,10 @@ async def forward_unmount_all_request(user_id: str):
     except Exception as exc:
         logger.error("Failed to unmount all for %s: %s", uid, exc)
         return JSONResponse(status_code=502, content={"error": f"Failed to unmount all: {str(exc)}", "status": "error"})
+
+
+# Include multi-user API router in central_hub app
+app.include_router(hub_router)
 
 
 def rewrite_single_href(url: str, tunnel_url: str, user_id: str) -> str:

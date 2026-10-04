@@ -98,7 +98,7 @@ def parse_args(argv=None):
     default_hub = (
         os.environ.get("CLOUDSTREAM_HUB_URL")
         or os.environ.get("HUB_URL")
-        or "https://cloudstream-hub.onrender.com"
+        or "https://cloud-stream-bridge.onrender.com"
     )
     default_port = int(os.environ.get("PORT", "7860"))
 
@@ -110,7 +110,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--hub",
         default=default_hub,
-        help="Central Pointer Hub URL (default: CLOUDSTREAM_HUB_URL or 'https://cloudstream-hub.onrender.com')"
+        help="Central Pointer Hub URL (default: CLOUDSTREAM_HUB_URL or 'https://cloud-stream-bridge.onrender.com')"
     )
     parser.add_argument(
         "--port",
@@ -481,7 +481,7 @@ def print_banner(
     tunnel_url: str,
     mount_count: int,
     user_id: str = "default",
-    hub_url: str = "https://cloudstream-hub.onrender.com"
+    hub_url: str = "https://cloud-stream-bridge.onrender.com"
 ):
     """Print visually stunning ANSI box with Step 2 status and Step 3 CX File Explorer setup."""
     clean_hub = hub_url.rstrip("/")
@@ -527,7 +527,7 @@ def get_live_status(port: int = 7860):
 
 
 def run_heartbeat_loop(
-    hub_url: str = "https://cloudstream-hub.onrender.com",
+    hub_url: str = "https://cloud-stream-bridge.onrender.com",
     user_id: str = "default",
     tunnel_url: str = "",
     port: int = 7860

@@ -101,6 +101,9 @@ class MountManager:
     def get_by_filename(self, filename: str) -> Optional[Dict[str, Any]]:
         return self.mounts.get(filename)
 
+    def get_mount(self, filename: str) -> Optional[Dict[str, Any]]:
+        return self.mounts.get(filename)
+
     def remove_mount(self, filename: str) -> bool:
         if filename in self.mounts:
             del self.mounts[filename]

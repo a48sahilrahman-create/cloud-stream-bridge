@@ -24,7 +24,7 @@ WHITE="\033[1;37m"
 RESET="\033[0m"
 
 USER_ID="${1:-${CLOUDSTREAM_USER_ID:-}}"
-HUB_URL="${2:-${CLOUDSTREAM_HUB_URL:-https://cloudstream-hub.onrender.com}}"
+HUB_URL="${2:-${CLOUDSTREAM_HUB_URL:-https://cloud-stream-bridge.onrender.com}}"
 
 # Prompt for unique hardware device username if not supplied via argument or env var
 if [ -z "$USER_ID" ]; then
