@@ -510,6 +510,58 @@ def test_mounts_db_path_env_override(tmp_path, monkeypatch):
         mount_manager.load()
 
 
+def test_webdav_special_characters_filename():
+    """
+    Verify WebDAV mount, PROPFIND, HEAD, GET, and DELETE for filenames
+    with spaces and brackets: 'Test Movie [2024] 4K.mkv'.
+    Ensures RFC 4918 §8.3 compliant URI-quoted hrefs and correct unquoting on incoming requests.
+    """
+    filename = "Test Movie [2024] 4K.mkv"
+    mount_manager.add_mount(
+        movie_id="special_chars_test",
+        filename=filename,
+        upstream_url="https://example.com/test_movie.mkv",
+        total_bytes=5368709120,  # 5 GB
+        content_type="video/x-matroska",
+        formatted_size="5.0 GB",
+        title="Test Movie [2024] 4K"
+    )
+    try:
+        # 1. PROPFIND directory listing /dav/
+        resp_dir = client.request("PROPFIND", "/dav/", headers={"Depth": "1"})
+        assert resp_dir.status_code == 207
+        # RFC 4918 §8.3 compliant URI-quoted href
+        assert "Test%20Movie%20%5B2024%5D%204K.mkv" in resp_dir.text
+        # Clean human-readable XML-escaped displayname
+        assert f"<D:displayname>{filename}</D:displayname>" in resp_dir.text
+
+        # 2. PROPFIND single file with percent-encoded path
+        quoted_name = "Test%20Movie%20%5B2024%5D%204K.mkv"
+        resp_pf = client.request("PROPFIND", f"/dav/{quoted_name}")
+        assert resp_pf.status_code == 207
+        assert quoted_name in resp_pf.text
+        assert f"<D:displayname>{filename}</D:displayname>" in resp_pf.text
+
+        # 3. HEAD request with percent-encoded path
+        resp_head = client.head(f"/dav/{quoted_name}")
+        assert resp_head.status_code == 200
+        assert resp_head.headers.get("Accept-Ranges") == "bytes"
+        assert resp_head.headers.get("Content-Length") == "5368709120"
+        assert resp_head.headers.get("Content-Type") == "video/x-matroska"
+
+        # 4. GET request with percent-encoded path (302 redirect to upstream_url)
+        resp_get = client.get(f"/dav/{quoted_name}", follow_redirects=False)
+        assert resp_get.status_code == 302
+        assert resp_get.headers.get("Location") == "https://example.com/test_movie.mkv"
+
+        # 5. WebDAV DELETE request with percent-encoded path
+        resp_del = client.delete(f"/dav/{quoted_name}")
+        assert resp_del.status_code == 204
+        assert mount_manager.get_by_filename(filename) is None
+    finally:
+        mount_manager.remove_mount(filename)
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

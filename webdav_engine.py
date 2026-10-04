@@ -13,6 +13,7 @@ import os
 import json
 import base64
 import email.utils
+from urllib.parse import unquote, quote
 from xml.sax.saxutils import escape
 from typing import Dict, Any, Optional
 from starlette.requests import Request
@@ -119,7 +120,7 @@ def _build_file_propstat(mount: Dict[str, Any], base_path: str) -> list:
     created_at = mount.get("created_at", time.time())
     mod_date = format_http_date(created_at)
     iso_creation_date = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(created_at))
-    raw_href = f"{base_path.rstrip('/')}/{filename}"
+    raw_href = f"{base_path.rstrip('/')}/{quote(filename)}"
     safe_href = xml_escape(raw_href)
     etag = f'"{abs(hash(raw_href))}"'
 
@@ -247,7 +248,7 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
     # 2. PROPFIND Method (Directory & File Metadata Listing)
     if method == "PROPFIND":
         if path:
-            filename = path.split("/")[-1]
+            filename = unquote(path.split("/")[-1])
             mount = mount_manager.get_by_filename(filename)
             if not mount:
                 return PlainTextResponse(f"File '{filename}' not found on WebDAV bridge.", status_code=404)
@@ -294,10 +295,12 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
 
     # 4. Path resolution for specific file
     if not path:
+        if method == "DELETE":
+            return PlainTextResponse("Cannot delete WebDAV root collection.", status_code=403)
         # Requesting root /dav/ with GET or HEAD
         return PlainTextResponse("CloudStream WebDAV Bridge Active. Connect via CX File Explorer.", status_code=200)
 
-    filename = path.split("/")[-1]
+    filename = unquote(path.split("/")[-1])
     mount = mount_manager.get_by_filename(filename)
 
     if not mount:
@@ -353,6 +356,7 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
     if method == "DELETE":
         if not path:
             return PlainTextResponse("Cannot delete WebDAV root collection.", status_code=403)
+        filename = unquote(path.split("/")[-1])
         removed = mount_manager.remove_mount(filename)
         if removed:
             return Response(status_code=204)

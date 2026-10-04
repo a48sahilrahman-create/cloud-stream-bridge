@@ -169,6 +169,81 @@ def test_register_with_hub_missing_fields():
     assert csr.register_with_hub("https://hub.com", "usr_test", "") is False
 
 
+def test_is_valid_tunnel_url():
+    """Verify validation logic for public Cloudflare tunnel URLs."""
+    # Valid trycloudflare URLs
+    assert csr.is_valid_tunnel_url("https://alpha-123.trycloudflare.com") is True
+    assert csr.is_valid_tunnel_url("https://my-subdomain.trycloudflare.com/") is True
+    assert csr.is_valid_tunnel_url("http://tunnel.trycloudflare.com:8080") is True
+
+    # Localhost and loopback must be strictly rejected
+    assert csr.is_valid_tunnel_url("http://localhost:7860") is False
+    assert csr.is_valid_tunnel_url("http://localhost") is False
+    assert csr.is_valid_tunnel_url("http://127.0.0.1:7860") is False
+    assert csr.is_valid_tunnel_url("http://127.0.0.1") is False
+
+    # Arbitrary non-trycloudflare domains must be rejected
+    assert csr.is_valid_tunnel_url("https://example.com") is False
+    assert csr.is_valid_tunnel_url("http://192.168.1.50:7860") is False
+    assert csr.is_valid_tunnel_url("https://myhub.onrender.com") is False
+
+    # Empty, None, or invalid types
+    assert csr.is_valid_tunnel_url("") is False
+    assert csr.is_valid_tunnel_url(None) is False
+    assert csr.is_valid_tunnel_url(12345) is False
+
+
+def test_register_with_hub_rejects_localhost(capsys):
+    """Verify register_with_hub rejects localhost and does NOT make HTTP requests."""
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        result = csr.register_with_hub(
+            "https://cloudstream-hub.onrender.com",
+            "usr_local",
+            "http://localhost:7860",
+            verbose=True
+        )
+        assert result is False
+        mock_urlopen.assert_not_called()
+
+    captured = capsys.readouterr().out
+    assert "Error" in captured
+    assert "tunnel failed to establish" in captured.lower()
+
+
+def test_register_with_hub_rejects_127_0_0_1(capsys):
+    """Verify register_with_hub rejects 127.0.0.1 and does NOT make HTTP requests."""
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        result = csr.register_with_hub(
+            "https://cloudstream-hub.onrender.com",
+            "usr_local",
+            "http://127.0.0.1:7860",
+            verbose=True
+        )
+        assert result is False
+        mock_urlopen.assert_not_called()
+
+    captured = capsys.readouterr().out
+    assert "Error" in captured
+    assert "tunnel failed to establish" in captured.lower()
+
+
+def test_register_with_hub_rejects_non_cloudflare_fallback(capsys):
+    """Verify register_with_hub rejects URLs without trycloudflare.com."""
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        result = csr.register_with_hub(
+            "https://cloudstream-hub.onrender.com",
+            "usr_local",
+            "https://arbitrary-fallback.com",
+            verbose=True
+        )
+        assert result is False
+        mock_urlopen.assert_not_called()
+
+    captured = capsys.readouterr().out
+    assert "Error" in captured
+    assert "tunnel failed to establish" in captured.lower()
+
+
 def test_register_payload_httpx_schema_validation():
     """Verify registration payload compatibility using httpx Request."""
     user_id = "usr_httpx_check"
@@ -289,3 +364,163 @@ def test_get_live_status_offline():
     with patch("urllib.request.urlopen", side_effect=Exception("Server not running")):
         status = csr.get_live_status(port=7860)
         assert status is None
+
+
+# ==============================================================================
+# 6. Tunnel URL Extraction & ANSI Stripping Tests
+# ==============================================================================
+
+def test_extract_tunnel_url_with_ansi_sequences(tmp_path, monkeypatch, capsys):
+    """Verify that extract_tunnel_url strips ANSI escape sequences before regex match."""
+    test_log = tmp_path / "tunnel.log"
+    # Write cloudflared output line embedded with ANSI escape sequences
+    test_log.write_text(
+        "\x1b[32m2026-10-04T12:00:00Z\x1b[0m \x1b[1;36mINF\x1b[0m |  "
+        "Your quick Tunnel has been created: \x1b[4;34mhttps://alpha-bravo-123.trycloudflare.com\x1b[0m\n",
+        encoding="utf-8"
+    )
+
+    monkeypatch.setattr(csr, "TUNNEL_LOG", str(test_log))
+    monkeypatch.setattr(csr, "tunnel_proc", None)
+
+    url = csr.extract_tunnel_url(timeout_secs=2)
+    assert url == "https://alpha-bravo-123.trycloudflare.com"
+
+    out = capsys.readouterr().out
+    assert "Successfully extracted Cloudflare tunnel URL" in out
+
+
+def test_extract_tunnel_url_cloudflared_fails(tmp_path, monkeypatch, capsys):
+    """Verify robust error logging and premature exit when cloudflared process fails."""
+    test_log = tmp_path / "tunnel.log"
+    test_log.write_text("\x1b[31mError: cloudflared crashed with code 1\x1b[0m\n", encoding="utf-8")
+
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = 1  # Process terminated with exit code 1
+
+    monkeypatch.setattr(csr, "TUNNEL_LOG", str(test_log))
+    monkeypatch.setattr(csr, "tunnel_proc", mock_proc)
+
+    url = csr.extract_tunnel_url(timeout_secs=5)
+    assert url == ""
+
+    out = capsys.readouterr().out
+    assert "Cloudflared failed: process exited prematurely with exit code 1" in out
+    assert "cloudflared output:" in out
+
+
+def test_extract_tunnel_url_timeout(tmp_path, monkeypatch, capsys):
+    """Verify timeout handling and warning logging when tunnel URL cannot be extracted."""
+    test_log = tmp_path / "tunnel.log"
+    test_log.write_text("Waiting for tunnel connection...\n", encoding="utf-8")
+
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None  # Process still running
+
+    monkeypatch.setattr(csr, "TUNNEL_LOG", str(test_log))
+    monkeypatch.setattr(csr, "tunnel_proc", mock_proc)
+
+    url = csr.extract_tunnel_url(timeout_secs=1)
+    assert url == ""
+
+    out = capsys.readouterr().out
+    assert "Failed to extract trycloudflare URL within 1s timeout" in out
+
+
+def test_register_with_hub_timeout_error(capsys):
+    """Verify that timeout errors (e.g. Render cold boot) are caught and logged clearly."""
+    timeout_err = urllib.error.URLError("timed out")
+
+    with patch("urllib.request.urlopen", side_effect=timeout_err) as mock_urlopen:
+        result = csr.register_with_hub(
+            "https://cloudstream-hub.onrender.com",
+            "usr_timeout",
+            "https://test.trycloudflare.com",
+            timeout=15.0,
+            verbose=True
+        )
+        assert result is False
+        assert mock_urlopen.call_count == 1
+        assert mock_urlopen.call_args[1]["timeout"] == 15.0
+
+    out = capsys.readouterr().out
+    assert "Hub registration timed out after 15.0s (Render cold boot may be in progress)" in out
+
+
+def test_register_with_hub_http_error_logging(capsys):
+    """Verify that HTTP errors log detailed status code and error messages."""
+    error = urllib.error.HTTPError(
+        url="https://cloudstream-hub.onrender.com/api/register",
+        code=502,
+        msg="Bad Gateway",
+        hdrs={},
+        fp=io.BytesIO(b'{"detail": "upstream service unavailable"}')
+    )
+
+    with patch("urllib.request.urlopen", side_effect=error):
+        result = csr.register_with_hub(
+            "https://cloudstream-hub.onrender.com",
+            "usr_err",
+            "https://test.trycloudflare.com",
+            verbose=False,
+            log_errors=True
+        )
+        assert result is False
+
+    out = capsys.readouterr().out
+    assert "Hub registration HTTP error 502" in out
+    assert "upstream service unavailable" in out
+
+
+def test_extract_tunnel_url_immediate_exit_on_crash(monkeypatch):
+    """Verify extract_tunnel_url exits immediately if cloudflared crashes, without waiting 45s."""
+    import time
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = 1  # Process crashed on start
+
+    monkeypatch.setattr(csr, "tunnel_proc", mock_proc)
+
+    start = time.time()
+    url = csr.extract_tunnel_url(timeout_secs=45)
+    duration = time.time() - start
+
+    assert url == ""
+    assert duration < 2.0  # Must terminate immediately without waiting 45s
+
+
+def test_run_heartbeat_loop_breaks_on_tunnel_exit(monkeypatch):
+    """Verify heartbeat loop breaks immediately and does not ping hub when tunnel process exits."""
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = 1  # Tunnel process exited
+    monkeypatch.setattr(csr, "tunnel_proc", mock_proc)
+
+    with patch("cloud_shell_runner.register_with_hub") as mock_reg, \
+         patch("cloud_shell_runner.get_live_status") as mock_status:
+        csr.run_heartbeat_loop(
+            hub_url="https://cloudstream-hub.onrender.com",
+            user_id="test_user",
+            tunnel_url="https://dead-tunnel.trycloudflare.com"
+        )
+        # Should break immediately without querying status or pinging hub
+        assert mock_reg.call_count == 0
+        assert mock_status.call_count == 0
+
+
+def test_run_heartbeat_loop_detects_exit_during_interval(monkeypatch):
+    """Verify heartbeat loop detects tunnel exit during 50s interval and stops loop."""
+    mock_proc = MagicMock()
+    # Pulse 1: process running (None), interval wait: process died (1)
+    mock_proc.poll.side_effect = [None, 1, 1, 1]
+    monkeypatch.setattr(csr, "tunnel_proc", mock_proc)
+
+    with patch("cloud_shell_runner.register_with_hub", return_value=True) as mock_reg, \
+         patch("cloud_shell_runner.get_live_status", return_value={"mounted_count": 1}), \
+         patch("cloud_shell_runner.is_valid_tunnel_url", return_value=True):
+        csr.run_heartbeat_loop(
+            hub_url="https://cloudstream-hub.onrender.com",
+            user_id="test_user",
+            tunnel_url="https://active.trycloudflare.com"
+        )
+        assert mock_reg.call_count == 1
+
+

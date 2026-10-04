@@ -8,7 +8,31 @@ server.log
 tunnel.log
 mounts.json
 .pytest_cache/
+.coverage
+htmlcov/
 
+# Environment and sensitive keys
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.cert
+
+# Temporary and cache files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Workspace and tool artifacts
 .agentic_workspace/
 repomix-output.xml
 .bin/
+.vscode/
+.idea/
+
