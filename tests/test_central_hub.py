@@ -221,6 +221,25 @@ def test_dav_redirect_root_dav_folder():
     assert res2.headers["Location"] == "https://cf-tunnel.trycloudflare.com/dav/"
 
 
+def test_dav_redirect_spaces_percent_encoded():
+    """Requesting /dav/{user_id}/Movie Name [2024].mkv produces a properly percent-encoded Location header without spaces."""
+    client.post("/api/register", json={
+        "user_id": "usr_spaces",
+        "tunnel_url": "https://spaces-tunnel.trycloudflare.com",
+    })
+
+    response = client.get(
+        "/dav/usr_spaces/Movie Name [2024].mkv",
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    location = response.headers["Location"]
+    assert " " not in location
+    assert location == "https://spaces-tunnel.trycloudflare.com/dav/Movie%20Name%20%5B2024%5D.mkv"
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert response.headers["DAV"] == "1"
+
+
 def test_dav_redirect_http_methods():
     """Streaming methods (GET, HEAD) receive HTTP 302 Found redirect preserving zero video proxying."""
     client.post("/api/register", json={
@@ -275,6 +294,41 @@ def test_dav_proxy_metadata_methods():
             assert "host" not in [k.lower() for k in call_kwargs["headers"].keys()]
             assert call_kwargs["headers"].get("depth") == "1"
             assert call_kwargs["content"] == b"<propfind/>"
+
+
+def test_dav_proxy_forwards_upstream_headers():
+    """Ensure upstream headers (Allow, DAV, MS-Author-Via, ETag) from tunnel proxy are forwarded in PROPFIND / OPTIONS."""
+    client.post("/api/register", json={
+        "user_id": "usr_upstream_hdrs",
+        "tunnel_url": "https://cf-proxy.trycloudflare.com",
+    })
+
+    mock_resp = httpx.Response(
+        status_code=207,
+        content=b'<?xml version="1.0"?><multistatus></multistatus>',
+        headers={
+            "content-type": "application/xml; charset=utf-8",
+            "Allow": "OPTIONS, GET, HEAD, PROPFIND",
+            "DAV": "1, 2",
+            "MS-Author-Via": "DAV",
+            "ETag": '"etag-val-123"',
+        },
+    )
+
+    with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as mock_req:
+        mock_req.return_value = mock_resp
+
+        for method in ["PROPFIND", "OPTIONS"]:
+            res = client.request(
+                method=method,
+                url="/dav/usr_upstream_hdrs/folder",
+                follow_redirects=False,
+            )
+            assert res.status_code == 207
+            assert res.headers["Allow"] == "OPTIONS, GET, HEAD, PROPFIND"
+            assert res.headers["DAV"] == "1, 2"
+            assert res.headers["MS-Author-Via"] == "DAV"
+            assert res.headers["ETag"] == '"etag-val-123"'
 
 
 # ============================================================================

@@ -8,10 +8,13 @@ Zero video byte proxying; zero bandwidth consumption on the hub.
 """
 
 import os
+import re
 import time
 import logging
 import threading
 from typing import Optional, Dict, Any
+from urllib.parse import quote
+from xml.sax.saxutils import escape as xml_escape
 
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException
@@ -405,8 +408,9 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
     registry.touch(uid)
 
     clean_path = path.lstrip("/")
+    encoded_path = quote(clean_path, safe="/:@?=&") if clean_path else ""
     tunnel_url = entry["tunnel_url"].rstrip("/")
-    target_url = f"{tunnel_url}/dav/{clean_path}" if clean_path else f"{tunnel_url}/dav/"
+    target_url = f"{tunnel_url}/dav/{encoded_path}" if encoded_path else f"{tunnel_url}/dav/"
 
     if request.url.query:
         target_url = f"{target_url}?{request.url.query}"
@@ -428,16 +432,21 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
                     content=body,
                 )
                 media_type = resp.headers.get("content-type", "application/xml; charset=utf-8")
+                response_headers = {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                    "DAV": "1",
+                }
+                for header_name in ("Allow", "DAV", "MS-Author-Via", "ETag"):
+                    if header_name in resp.headers:
+                        response_headers[header_name] = resp.headers[header_name]
+
                 return Response(
                     content=resp.content,
                     status_code=resp.status_code,
                     media_type=media_type,
-                    headers={
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Methods": "*",
-                        "Access-Control-Allow-Headers": "*",
-                        "DAV": "1",
-                    },
+                    headers=response_headers,
                 )
         except Exception as exc:
             logger.error("WebDAV proxy %s to %s failed: %s", request.method, target_url, exc)
