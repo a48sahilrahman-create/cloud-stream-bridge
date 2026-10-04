@@ -93,6 +93,12 @@ class MountManager:
             return True
         return False
 
+    def clear_all(self) -> int:
+        count = len(self.mounts)
+        self.mounts.clear()
+        self.save()
+        return count
+
     def list_all(self):
         return list(self.mounts.values())
 
@@ -232,7 +238,7 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
             headers={
                 "DAV": "1",
                 "MS-Author-Via": "DAV",
-                "Allow": "OPTIONS, GET, HEAD, PROPFIND, PROPPATCH",
+                "Allow": "OPTIONS, GET, HEAD, PROPFIND, PROPPATCH, DELETE",
                 "Accept-Ranges": "bytes",
                 "Content-Length": "0"
             }
@@ -342,5 +348,14 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
             total_size=total_bytes,
             content_type=content_type
         )
+
+    # 6. DELETE Method (RFC 4918 File Unmounting)
+    if method == "DELETE":
+        if not path:
+            return PlainTextResponse("Cannot delete WebDAV root collection.", status_code=403)
+        removed = mount_manager.remove_mount(filename)
+        if removed:
+            return Response(status_code=204)
+        return PlainTextResponse(f"File '{filename}' not found on WebDAV bridge.", status_code=404)
 
     return PlainTextResponse(f"Method {method} not supported on WebDAV bridge.", status_code=405)

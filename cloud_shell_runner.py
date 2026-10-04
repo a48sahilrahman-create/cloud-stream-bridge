@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-CloudStream WebDAV Bridge - Google Cloud Shell Persistent Runner & Anti-Idle Daemon
+CloudStream WebDAV Bridge - Step 2: Google Cloud Shell Launcher (Persistent Runner & Anti-Idle Daemon)
 Optimized for Google Cloud Shell (5GB Persistent Disk at $HOME).
+Routes streams using unique hardware-anchored device username (e.g. rmx3031-4f9a2e81c0d5) with zero Google Sign-In dependencies.
+
+Updated 3-Step Suite Workflow:
+  - Step 1: Device Identity & Pointer Hub (CloudStream Android App)
+  - Step 2: Google Cloud Shell Launcher (Persistent Cloud Runner & Telemetry Pulse)
+  - Step 3: CX File Explorer Setup (Permanent WebDAV Streaming on Android TV & Phone)
 
 Features:
   - Persistent Library: Stored at $HOME/.cloudstream-bridge/mounts.json across reboots/restarts.
@@ -20,8 +26,10 @@ import re
 import signal
 import shutil
 import urllib.request
+import urllib.error
 import subprocess
 import json
+import argparse
 from datetime import datetime
 
 # ANSI Color codes
@@ -74,6 +82,83 @@ def cleanup_and_exit(signum=None, frame=None):
 
     print(f"{GREEN}[✓] CloudStream Bridge successfully stopped.{RESET}")
     sys.exit(0)
+
+
+def parse_args(argv=None):
+    """Parse command line arguments with environment variable fallbacks."""
+    parser = argparse.ArgumentParser(
+        description="CloudStream WebDAV Bridge - Step 2: Google Cloud Shell Launcher (Routes via unique hardware-anchored device username, e.g. rmx3031-4f9a2e81c0d5, zero Google Sign-In dependencies)"
+    )
+    default_user = (
+        os.environ.get("CLOUDSTREAM_USER_ID")
+        or os.environ.get("USER_ID")
+        or "default"
+    )
+    default_hub = (
+        os.environ.get("CLOUDSTREAM_HUB_URL")
+        or os.environ.get("HUB_URL")
+        or "https://cloudstream-hub.onrender.com"
+    )
+    default_port = int(os.environ.get("PORT", "7860"))
+
+    parser.add_argument(
+        "--user",
+        default=default_user,
+        help="Unique hardware-anchored device username (e.g. rmx3031-4f9a2e81c0d5, zero Google Sign-In) for multi-user routing (default: CLOUDSTREAM_USER_ID or 'default')"
+    )
+    parser.add_argument(
+        "--hub",
+        default=default_hub,
+        help="Central Pointer Hub URL (default: CLOUDSTREAM_HUB_URL or 'https://cloudstream-hub.onrender.com')"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=default_port,
+        help="Port for local FastAPI server (default: 7860)"
+    )
+    return parser.parse_args(argv)
+
+
+def register_with_hub(hub_url: str, user_id: str, tunnel_url: str, timeout: float = 8.0, verbose: bool = True) -> bool:
+    """
+    Sends HTTP POST to {hub_url}/api/register with {"user_id": user_id, "tunnel_url": tunnel_url}.
+    Logs clean success or warning message.
+    """
+    if not hub_url or not user_id or not tunnel_url:
+        if verbose:
+            print(f"{YELLOW}[!] Registration skipped: missing hub_url, user_id, or tunnel_url.{RESET}")
+        return False
+
+    clean_hub = hub_url.rstrip("/")
+    endpoint = f"{clean_hub}/api/register"
+    payload = json.dumps({"user_id": user_id, "tunnel_url": tunnel_url}).encode("utf-8")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "CloudStreamRunner/1.0"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", getattr(resp, "code", 200))
+            if 200 <= status < 300:
+                if verbose:
+                    print(f"{GREEN}[✓] Successfully registered with Hub ({clean_hub}) for device username '{user_id}'.{RESET}")
+                return True
+            else:
+                if verbose:
+                    print(f"{YELLOW}[!] Hub registration returned HTTP status {status}.{RESET}")
+                return False
+    except Exception as e:
+        if verbose:
+            print(f"{YELLOW}[!] Hub registration warning ({endpoint}): {e}{RESET}")
+        return False
 
 
 def setup_persistent_storage():
@@ -186,7 +271,7 @@ def kill_old_processes():
         time.sleep(1)
 
 
-def launch_server() -> subprocess.Popen:
+def launch_server(port: int = 7860) -> subprocess.Popen:
     """Launch FastAPI server with stdout/stderr directed to server.log."""
     global server_proc
     env = os.environ.copy()
@@ -195,13 +280,13 @@ def launch_server() -> subprocess.Popen:
 
     log_file = open(SERVER_LOG, "w", encoding="utf-8")
     server_proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"],
+        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", str(port)],
         cwd=REPO_DIR,
         stdout=log_file,
         stderr=log_file,
         env=env
     )
-    print(f"{CYAN}[*] CloudStream FastAPI server launched (PID: {server_proc.pid}){RESET}")
+    print(f"{CYAN}[*] CloudStream FastAPI server launched on port {port} (PID: {server_proc.pid}){RESET}")
     print(f"{DIM}    Server logs: {SERVER_LOG}{RESET}")
 
     # Wait for server to become responsive
@@ -209,7 +294,7 @@ def launch_server() -> subprocess.Popen:
     for _ in range(20):
         time.sleep(0.5)
         try:
-            req = urllib.request.Request("http://127.0.0.1:7860/health")
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
             with urllib.request.urlopen(req, timeout=1.5) as r:
                 if r.status == 200:
                     healthy = True
@@ -218,15 +303,15 @@ def launch_server() -> subprocess.Popen:
             pass
 
     if healthy:
-        print(f"{GREEN}[✓] Local FastAPI server online & healthy on port 7860.{RESET}")
+        print(f"{GREEN}[✓] Local FastAPI server online & healthy on port {port}.{RESET}")
     else:
         print(f"{YELLOW}[!] Server launched, waiting for initial requests...{RESET}")
 
     return server_proc
 
 
-def launch_tunnel(cloudflared_path: str) -> subprocess.Popen:
-    """Launch cloudflared tunnel pointing to http://localhost:7860."""
+def launch_tunnel(cloudflared_path: str, port: int = 7860) -> subprocess.Popen:
+    """Launch cloudflared tunnel pointing to http://localhost:{port}."""
     global tunnel_proc
     if os.path.exists(TUNNEL_LOG):
         try:
@@ -235,7 +320,7 @@ def launch_tunnel(cloudflared_path: str) -> subprocess.Popen:
             pass
 
     log_file = open(TUNNEL_LOG, "w", encoding="utf-8")
-    tunnel_cmd = [cloudflared_path, "tunnel", "--url", "http://localhost:7860"]
+    tunnel_cmd = [cloudflared_path, "tunnel", "--url", f"http://localhost:{port}"]
     tunnel_proc = subprocess.Popen(
         tunnel_cmd,
         stdout=log_file,
@@ -283,36 +368,62 @@ def print_ascii_qr(url: str):
         pass
 
 
-def print_banner(tunnel_url: str, mount_count: int):
-    """Print visually stunning ANSI box with connection endpoints."""
-    host = tunnel_url.replace("https://", "").replace("http://", "").rstrip("/")
-    dav_url = f"{tunnel_url}/dav/"
+ANSI_PATTERN = re.compile(r"\033\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes for accurate string length measurement."""
+    return ANSI_PATTERN.sub("", text)
+
+
+def _box_row(content: str, border_len: int = 76) -> str:
+    """Format a single box row ensuring exact outer border alignment."""
+    plain_len = len(_strip_ansi(content))
+    pad = max(0, border_len - 1 - plain_len)
+    return f"{CYAN}║{RESET} {content}" + (" " * pad) + f"{CYAN}║{RESET}"
+
+
+def print_banner(
+    tunnel_url: str,
+    mount_count: int,
+    user_id: str = "default",
+    hub_url: str = "https://cloudstream-hub.onrender.com"
+):
+    """Print visually stunning ANSI box with Step 2 status and Step 3 CX File Explorer setup."""
+    clean_hub = hub_url.rstrip("/")
+    perm_dav = f"{clean_hub}/dav/{user_id}/"
+    direct_dav = f"{tunnel_url.rstrip('/')}/dav/"
+    hub_host = clean_hub.replace("https://", "").replace("http://", "").split("/")[0]
+
     border_len = 76
     line_sep = "═" * border_len
 
     print(f"\n{CYAN}╔{line_sep}╗{RESET}")
-    print(f"{CYAN}║{RESET}  {GREEN}{BOLD}🎬 CLOUDSTREAM GOOGLE CLOUD SHELL BRIDGE ONLINE{RESET}" + " " * (border_len - 49) + f"{CYAN}║{RESET}")
+    print(_box_row(f"{GREEN}{BOLD}🎬 STEP 2: GOOGLE CLOUD SHELL LAUNCHER ONLINE{RESET}", border_len))
     print(f"{CYAN}╠{line_sep}╣{RESET}")
-    print(f"{CYAN}║{RESET}  {WHITE}{BOLD}🌐 Web UI:{RESET}            {CYAN}{tunnel_url:<54}{RESET} {CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}  {WHITE}{BOLD}📁 WebDAV URL:{RESET}        {CYAN}{dav_url:<54}{RESET} {CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}" + " " * border_len + f"{CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}  {YELLOW}{BOLD}📱 CX File Explorer Settings (Android TV & Phone):{RESET}" + " " * (border_len - 52) + f"{CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}     • Protocol:    {WHITE}WebDAV{RESET}" + " " * (border_len - 26) + f"{CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}     • Host:        {CYAN}{host:<58}{RESET} {CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}     • Port:        {WHITE}443{RESET}" + " " * (border_len - 23) + f"{CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}     • Path:        {WHITE}/dav{RESET}" + " " * (border_len - 24) + f"{CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}     • HTTPS:       {GREEN}ON (Checked){RESET}" + " " * (border_len - 32) + f"{CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}     • Username:    {WHITE}admin (or check Anonymous){RESET}" + " " * (border_len - 46) + f"{CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}" + " " * border_len + f"{CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}  {MAGENTA}{BOLD}📺 Android APK Cloud Endpoint:{RESET} {CYAN}{tunnel_url:<44}{RESET} {CYAN}║{RESET}")
-    print(f"{CYAN}║{RESET}  {GREEN}{BOLD}💾 Persistent Library:{RESET}         {WHITE}{mount_count} mounted streams loaded from disk{RESET}" + " " * max(0, border_len - 41 - len(str(mount_count)) - len(" mounted streams loaded from disk")) + f"{CYAN}║{RESET}")
+    print(_box_row(f"{WHITE}{BOLD}User ID:{RESET}          {MAGENTA}{BOLD}{user_id}{RESET}", border_len))
+    print(_box_row(f"  {DIM}└─ Unique hardware device ID (zero Google Sign-In){RESET}", border_len))
+    print(_box_row(f"{WHITE}{BOLD}Permanent WebDAV:{RESET} {GREEN}{BOLD}{perm_dav}{RESET}", border_len))
+    print(_box_row(f"{WHITE}{BOLD}Direct Tunnel:{RESET}    {CYAN}{direct_dav}{RESET}", border_len))
+    print(_box_row(f"{WHITE}{BOLD}Web UI:{RESET}           {CYAN}{tunnel_url}{RESET}", border_len))
+    print(_box_row("", border_len))
+    print(_box_row(f"{YELLOW}{BOLD}📱 Step 3: CX File Explorer Setup (Android TV & Phone):{RESET}", border_len))
+    print(_box_row(f"    • Protocol:    {WHITE}WebDAV{RESET}", border_len))
+    print(_box_row(f"    • Host:        {CYAN}{hub_host}{RESET} {DIM}(Permanent){RESET}", border_len))
+    print(_box_row(f"    • Port:        {WHITE}443{RESET}", border_len))
+    print(_box_row(f"    • Path:        {WHITE}/dav/{user_id}/{RESET}", border_len))
+    print(_box_row(f"    • HTTPS:       {GREEN}ON (Checked){RESET}", border_len))
+    print(_box_row(f"    • Username:    {WHITE}admin (or check Anonymous){RESET}", border_len))
+    print(_box_row("", border_len))
+    print(_box_row(f"{MAGENTA}{BOLD}📺 Android APK Endpoint:{RESET} {CYAN}{clean_hub}{RESET}", border_len))
+    print(_box_row(f"{GREEN}{BOLD}💾 Persistent Library:{RESET}   {WHITE}{mount_count} mounted streams loaded from disk{RESET}", border_len))
     print(f"{CYAN}╚{line_sep}╝{RESET}\n")
 
 
-def get_live_status():
+def get_live_status(port: int = 7860):
     """Query local /api/status for stream metrics."""
     try:
-        req = urllib.request.Request("http://127.0.0.1:7860/api/status")
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/status")
         with urllib.request.urlopen(req, timeout=3) as resp:
             if resp.status == 200:
                 return json.loads(resp.read().decode("utf-8"))
@@ -321,16 +432,23 @@ def get_live_status():
     return None
 
 
-def run_heartbeat_loop():
+def run_heartbeat_loop(
+    hub_url: str = "https://cloudstream-hub.onrender.com",
+    user_id: str = "default",
+    tunnel_url: str = "",
+    port: int = 7860
+):
     """
     12-Hour Anti-Idle Heartbeat Keep-Alive Loop.
     Google Cloud Shell disconnects after 20 minutes without terminal activity.
-    Emits a clean 1-line status pulse every 50 seconds to keep session active.
+    Emits a clean 1-line status pulse every 50 seconds to keep session active,
+    and sends a keep-alive pulse to {hub_url}/api/register to refresh central hub 12h TTL.
     """
     start_time = time.time()
     pulse_count = 0
-    print(f"{GREEN}[*] Anti-idle heartbeat active. Keep this Cloud Shell tab open while streaming.{RESET}")
-    print(f"{DIM}[*] Press Ctrl+C at any time to cleanly stop.{RESET}\n")
+    clean_hub = hub_url.rstrip("/") if hub_url else ""
+    print(f"{GREEN}[*] Step 2 anti-idle heartbeat active. Keep this Cloud Shell tab open while streaming.{RESET}")
+    print(f"{DIM}[*] Device: {user_id} (Zero Google Sign-In) | Hub: {clean_hub or 'None'} | Interval: 50s | Ctrl+C to stop.{RESET}\n")
 
     while True:
         try:
@@ -338,22 +456,31 @@ def run_heartbeat_loop():
             now_str = datetime.now().strftime("%H:%M:%S")
             uptime_min = int((time.time() - start_time) / 60)
 
-            status = get_live_status() or {}
+            # Query local status
+            status = get_live_status(port=port) or {}
             active_streams = status.get("active_streams", 0)
             library_gb = status.get("total_virtual_library_gb", 0.0)
             streamed_mb = status.get("streamed_mb", 0.0)
             streamed_gb = status.get("streamed_gb", 0.0)
             mounted_count = status.get("mounted_count", 0)
-
             streamed_str = f"{streamed_gb} GB" if streamed_gb >= 1.0 else f"{streamed_mb} MB"
+
+            # Hub keep-alive pulse (refresh 12-hour TTL on central hub)
+            hub_synced = False
+            if clean_hub and tunnel_url:
+                hub_synced = register_with_hub(clean_hub, user_id, tunnel_url, timeout=5.0, verbose=False)
+                hub_status_str = f"{GREEN}SYNCED [✓]{RESET}" if hub_synced else f"{YELLOW}DESYNC [!]{RESET}"
+            else:
+                hub_status_str = f"{DIM}N/A{RESET}"
 
             heartbeat_msg = (
                 f"{DIM}[{now_str}]{RESET} 💓 "
-                f"{GREEN}Heartbeat #{pulse_count}{RESET} | "
-                f"{CYAN}CloudStream Active{RESET} | "
-                f"Active Streams: {YELLOW}{active_streams}{RESET} | "
-                f"Library: {WHITE}{library_gb} GB ({mounted_count} items){RESET} | "
-                f"Consumed: {CYAN}{streamed_str}{RESET} | "
+                f"{GREEN}Pulse #{pulse_count}{RESET} | "
+                f"{CYAN}{user_id}{RESET} | "
+                f"Hub: {hub_status_str} | "
+                f"Streams: {YELLOW}{active_streams}{RESET} | "
+                f"Library: {WHITE}{library_gb}GB ({mounted_count}){RESET} | "
+                f"Data: {CYAN}{streamed_str}{RESET} | "
                 f"Uptime: {MAGENTA}{uptime_min}m{RESET}"
             )
             print(heartbeat_msg)
@@ -363,17 +490,25 @@ def run_heartbeat_loop():
             time.sleep(50)
         except (KeyboardInterrupt, SystemExit):
             break
-        except Exception as e:
+        except Exception:
             time.sleep(50)
 
 
 def main():
+    # 0. Parse CLI arguments
+    args = parse_args()
+    user_id = args.user
+    hub_url = args.hub
+    port = args.port
+
     # Register OS signal traps
     signal.signal(signal.SIGINT, cleanup_and_exit)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, cleanup_and_exit)
 
-    print(f"\n{BOLD}{CYAN}=== CloudStream Bridge Google Cloud Shell Persistent Runner ==={RESET}")
+    print(f"\n{BOLD}{CYAN}=== Step 2: Google Cloud Shell Launcher (CloudStream Bridge) ==={RESET}")
+    print(f"{CYAN}[*] Unique Device Username: {BOLD}{user_id}{RESET} (Zero Google Sign-In)")
+    print(f"{CYAN}[*] Central Hub URL:         {BOLD}{hub_url}{RESET}")
 
     # 1. Setup persistent storage
     mount_count = setup_persistent_storage()
@@ -388,10 +523,10 @@ def main():
     kill_old_processes()
 
     # 5. Launch FastAPI server
-    launch_server()
+    launch_server(port=port)
 
     # 6. Launch Cloudflare tunnel
-    launch_tunnel(cloudflared_bin)
+    launch_tunnel(cloudflared_bin, port=port)
 
     # 7. Extract public tunnel URL
     tunnel_url = extract_tunnel_url(timeout_secs=45)
@@ -399,15 +534,19 @@ def main():
     if not tunnel_url:
         print(f"\n{YELLOW}[!] Warning: Could not automatically parse trycloudflare URL within 45s.{RESET}")
         print(f"{DIM}    Check {TUNNEL_LOG} for details.{RESET}")
-        tunnel_url = "http://localhost:7860"
+        tunnel_url = f"http://localhost:{port}"
+    else:
+        # Register tunnel with central hub immediately upon discovery
+        if "trycloudflare.com" in tunnel_url or tunnel_url.startswith("http"):
+            register_with_hub(hub_url, user_id, tunnel_url, verbose=True)
 
     # 8. Display ASCII QR Code & ANSI Banner
     if "trycloudflare.com" in tunnel_url:
         print_ascii_qr(tunnel_url)
-    print_banner(tunnel_url, mount_count)
+    print_banner(tunnel_url, mount_count, user_id=user_id, hub_url=hub_url)
 
     # 9. Enter anti-idle heartbeat loop
-    run_heartbeat_loop()
+    run_heartbeat_loop(hub_url=hub_url, user_id=user_id, tunnel_url=tunnel_url, port=port)
 
     cleanup_and_exit()
 

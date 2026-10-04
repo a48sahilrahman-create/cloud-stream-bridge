@@ -47,13 +47,32 @@
 
 ---
 
+### Defect 7: CX File Explorer Connection Failure & RFC 4918 302 Redirection Incompatibility
+- **Symptom**: CX File Explorer failed to establish connection or add WebDAV storage when targeting Central Hub `/dav/<user_id>/` endpoint.
+- **Root Cause**: CX File Explorer strictly adheres to RFC 4918 specification and aborts on `HTTP 302 Found` redirection during WebDAV discovery queries (`PROPFIND`, `OPTIONS`). Furthermore, mismatched clipboard format prevented CX File Explorer from parsing connection parameters.
+- **Resolution**:
+  - Implemented hybrid method-aware routing in `central_hub.py` and Cloudflare Worker `worker.js`: WebDAV metadata and discovery verbs (`PROPFIND`, `OPTIONS`, `PROPPATCH`, `MKCOL`, `DELETE`) are transparently reverse-proxied directly to the upstream Google Cloud Shell tunnel, while media streaming requests (`GET`, `HEAD`) maintain direct `HTTP 302 Found` redirect bypass for high-bitrate 4K streaming.
+  - Aligned clipboard configuration in `MainActivity.kt` with CX File Explorer's exact connection keys (`Protocol: https`, `SSL: true`, `HTTPS: true`, `Anonymous: true`, and single-line JSON format).
+
+---
+
+### Defect 8: App Onboarding Workflow Inversion & Android TV D-Pad Focus Re-alignment
+- **Symptom**: Users attempting setup configured CX File Explorer before launching Google Cloud Shell, resulting in dormant 503 statuses and perceived setup failure. Additionally, D-pad navigation order was inconsistent after layout adjustments.
+- **Root Cause**: UI card hierarchy presented CX File Explorer Setup (Step 2) prior to Cloud Shell backend launch (Step 3).
+- **Resolution**:
+  - Inverted card sequence in `activity_main.xml`: Step 2 is now Google Cloud Shell Launcher (`card_cloud_shell`), and Step 3 is CX File Explorer Setup (`card_cx_setup`).
+  - Re-mapped D-pad focus graph (`nextFocusDown` / `nextFocusUp`) to establish a deterministic sequential traversal: `btn_refresh_status` -> `btn_copy_cmd` -> `btn_open_cloud_shell` -> `btn_copy_cx` -> `btn_open_vlc` -> `edit_mount_url`.
+
+---
+
 ## 2. Verification & Test Metrics
 
 | Suite | Status | Score | Coverage |
 | :--- | :---: | :---: | :--- |
+| **Central Hub & Cloud Shell Suite** (`pytest`) | 🟢 PASS | **61 / 61 (100%)** | Central Hub reverse-proxy, WebDAV 302 bypass, Cloud Shell runner, lifecycle integration |
 | **Canonical Pytest** (`test_webdav.py`) | 🟢 PASS | **11 / 11 (100%)** | RFC 4918 XML, Range parsing, HEAD, EBML magic bytes, R2 query parsing, single-file PROPFIND |
 | **CX Client Verification** (`verify_cx.py`) | 🟢 PASS | **9 / 9 (100%)** | OPTIONS /, PROPFIND Depth 0/1, GET range, HEAD, Content-Length |
-| **Python Syntax Compilation** | 🟢 PASS | **100% Valid** | `main.py`, `webdav_engine.py`, `range_proxy.py`, `stream_probe.py`, `standalone_server.py` |
+| **Python Syntax Compilation** | 🟢 PASS | **100% Valid** | `central_hub.py`, `main.py`, `webdav_engine.py`, `range_proxy.py`, `stream_probe.py`, `cloud_shell_runner.py` |
 
 ---
 

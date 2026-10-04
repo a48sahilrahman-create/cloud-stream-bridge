@@ -46,6 +46,10 @@ class MountRequest(BaseModel):
     custom_headers: Optional[dict] = None
 
 
+class UnmountRequest(BaseModel):
+    filename: str
+
+
 @app.api_route("/", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH"])
 async def root_dispatcher(request: Request):
     if request.method in ("OPTIONS", "PROPFIND", "PROPPATCH"):
@@ -163,12 +167,29 @@ async def api_list_mounts():
     return {"status": "success", "mounts": mount_manager.list_all()}
 
 
-@app.delete("/api/mounts/{filename}")
+@app.delete("/api/mounts/{filename:path}")
 async def api_unmount(filename: str):
-    removed = mount_manager.remove_mount(filename)
+    clean_filename = filename.strip()
+    removed = mount_manager.remove_mount(clean_filename)
     if removed:
-        return {"status": "success", "message": f"Unmounted {filename}"}
-    return JSONResponse({"status": "error", "message": "Not found"}, status_code=404)
+        return {"status": "success", "message": f"Unmounted {clean_filename}"}
+    return JSONResponse({"status": "error", "message": f"Stream '{clean_filename}' not found"}, status_code=404)
+
+
+@app.post("/api/unmount")
+async def api_unmount_post(req: UnmountRequest):
+    clean_filename = req.filename.strip()
+    removed = mount_manager.remove_mount(clean_filename)
+    if removed:
+        return {"status": "success", "message": f"Unmounted {clean_filename}"}
+    return JSONResponse({"status": "error", "message": f"Stream '{clean_filename}' not found"}, status_code=404)
+
+
+@app.delete("/api/mounts")
+@app.post("/api/unmount-all")
+async def api_unmount_all():
+    cleared_count = mount_manager.clear_all()
+    return {"status": "success", "cleared_count": cleared_count, "message": f"Unmounted {cleared_count} streams"}
 
 
 @app.get("/api/status")
@@ -246,8 +267,8 @@ async def startup_event():
 
 
 # WebDAV Endpoints (RFC 4918 Virtual Mount)
-@app.api_route("/dav", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH"])
-@app.api_route("/dav/{path:path}", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH"])
+@app.api_route("/dav", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "DELETE"])
+@app.api_route("/dav/{path:path}", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "DELETE"])
 async def webdav_dispatcher(request: Request, path: str = ""):
     if not path and request.method == "GET":
         accept = request.headers.get("accept", "")
@@ -259,7 +280,7 @@ async def webdav_dispatcher(request: Request, path: str = ""):
 
 
 # Root Fallback Dispatcher for clients that mount without /dav (e.g. CX File Explorer with empty Path)
-@app.api_route("/{filename:path}", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH"])
+@app.api_route("/{filename:path}", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH", "DELETE"])
 async def root_fallback_dispatcher(request: Request, filename: str):
     clean_fn = filename.strip("/")
     if clean_fn.startswith("api/") or clean_fn in ("ping", "health", "favicon.ico"):

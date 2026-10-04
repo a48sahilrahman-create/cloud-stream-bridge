@@ -304,6 +304,54 @@ def test_webdav_proppatch():
     assert "<D:multistatus" in resp.text
 
 
+def test_webdav_delete_and_unmount_apis():
+    """Verify WebDAV RFC 4918 DELETE and REST unmount APIs."""
+    # 1. Mount test file
+    mount_manager.add_mount(
+        movie_id="delete_test_1",
+        filename="DeleteMe.mkv",
+        upstream_url="https://example.com/del.mkv",
+        total_bytes=1024,
+        content_type="video/x-matroska",
+        formatted_size="1 KB"
+    )
+    assert mount_manager.get_by_filename("DeleteMe.mkv") is not None
+
+    # Test OPTIONS includes DELETE
+    opt_resp = client.options("/dav/")
+    assert opt_resp.status_code == 200
+    assert "DELETE" in opt_resp.headers.get("Allow", "")
+
+    # Test WebDAV DELETE method -> 204 No Content
+    del_resp = client.delete("/dav/DeleteMe.mkv")
+    assert del_resp.status_code == 204
+    assert mount_manager.get_by_filename("DeleteMe.mkv") is None
+
+    # 2. Test REST POST /api/unmount
+    mount_manager.add_mount(
+        movie_id="delete_test_2",
+        filename="UnmountViaPost.mkv",
+        upstream_url="https://example.com/unmount.mkv",
+        total_bytes=2048,
+        content_type="video/x-matroska",
+        formatted_size="2 KB"
+    )
+    resp_post = client.post("/api/unmount", json={"filename": "UnmountViaPost.mkv"})
+    assert resp_post.status_code == 200
+    assert resp_post.json()["status"] == "success"
+    assert mount_manager.get_by_filename("UnmountViaPost.mkv") is None
+
+    # 3. Test REST POST /api/unmount-all
+    mount_manager.add_mount("m1", "File1.mkv", "https://example.com/1.mkv", 100, "video/x-matroska", "100 B")
+    mount_manager.add_mount("m2", "File2.mkv", "https://example.com/2.mkv", 200, "video/x-matroska", "200 B")
+    assert len(mount_manager.list_all()) >= 2
+
+    resp_all = client.post("/api/unmount-all")
+    assert resp_all.status_code == 200
+    assert resp_all.json()["status"] == "success"
+    assert len(mount_manager.list_all()) == 0
+
+
 def test_permissive_basic_auth():
     """Verify clients sending credentials like admin:none are accepted."""
     import base64

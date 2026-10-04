@@ -1,0 +1,19 @@
+# Cloudflare Workers configuration for CloudStream Pointer Hub
+name = "cloudstream-pointer-hub"
+main = "worker.js"
+compatibility_date = "2024-03-01"
+
+# In production, bind a Cloudflare KV namespace for persistence across all edge nodes:
+# [[kv_namespaces]]
+# binding = "USER_REGISTRY"
+# id = "your-kv-namespace-id"
+# preview_id = "your-preview-kv-namespace-id"
+
+[vars]
+ENVIRONMENT = "production"
+DEFAULT_TTL_SEC = "43200"
+
+# Routes (example custom domain binding)
+# routes = [
+#   { pattern = "hub.yourdomain.com/*", zone_name = "yourdomain.com" }
+# ]
