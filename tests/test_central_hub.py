@@ -544,3 +544,169 @@ def test_thread_safety_concurrent_access():
 
     assert reg.get_active_count() == 10
     assert reg.get_total_count() == 10
+
+
+# ============================================================================
+# 8. WebDAV PROPFIND Href Rewriting & Stream Range / CDN 302 Tests
+# ============================================================================
+
+def test_dav_propfind_href_rewriting():
+    """PROPFIND response rewrites <D:href>, <d:href>, and <href> pointing to tunnel_url to hub's /dav/{user_id}/ path."""
+    user_id = "usr_propfind_test"
+    tunnel = "https://temp-cf-node.trycloudflare.com"
+    client.post("/api/register", json={
+        "user_id": user_id,
+        "tunnel_url": tunnel,
+    })
+
+    upstream_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>{tunnel}/dav/</D:href>
+    <D:propstat><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>{tunnel}/dav/movie1.mkv</D:href>
+    <D:propstat><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+  </D:response>
+  <D:response>
+    <href>{tunnel}/dav/subfolder/clip.mp4</href>
+    <propstat><status>HTTP/1.1 200 OK</status></propstat>
+  </D:response>
+  <D:response>
+    <D:href>/dav/relative_file.mkv</D:href>
+    <D:propstat><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+  </D:response>
+</D:multistatus>"""
+
+    mock_resp = httpx.Response(
+        status_code=207,
+        content=upstream_xml.encode("utf-8"),
+        headers={"content-type": "application/xml; charset=utf-8"},
+    )
+
+    with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as mock_req:
+        mock_req.return_value = mock_resp
+        res = client.request("PROPFIND", f"/dav/{user_id}/", headers={"Depth": "1"})
+        assert res.status_code == 207
+        body = res.text
+        # Assert temporary tunnel_url is completely stripped from hrefs
+        assert tunnel not in body
+        # Assert hub permanent paths are injected
+        assert f"<D:href>/dav/{user_id}/</D:href>" in body
+        assert f"<D:href>/dav/{user_id}/movie1.mkv</D:href>" in body
+        assert f"<href>/dav/{user_id}/subfolder/clip.mp4</href>" in body
+        assert f"<D:href>/dav/{user_id}/relative_file.mkv</D:href>" in body
+
+
+def test_dav_get_range_header_preserved():
+    """GET requests with Range header preserve Accept-Ranges and Range in 302 redirect."""
+    client.post("/api/register", json={
+        "user_id": "usr_range_check",
+        "tunnel_url": "https://cf-range.trycloudflare.com",
+    })
+
+    res = client.get(
+        "/dav/usr_range_check/big_movie.mkv",
+        headers={"Range": "bytes=1048576-2097151"},
+        follow_redirects=False,
+    )
+    assert res.status_code == 302
+    assert res.headers["Location"] == "https://cf-range.trycloudflare.com/dav/big_movie.mkv"
+    assert res.headers["Accept-Ranges"] == "bytes"
+    assert res.headers["Range"] == "bytes=1048576-2097151"
+    assert "Range" in res.headers["Access-Control-Expose-Headers"]
+
+
+def test_dav_get_direct_cdn_302_resolution():
+    """When resolve_cdn=1 is requested, hub queries tunnel and returns upstream CDN 302 directly."""
+    client.post("/api/register", json={
+        "user_id": "usr_cdn_test",
+        "tunnel_url": "https://cf-cdn.trycloudflare.com",
+    })
+
+    cdn_location = "https://fast-upstream-cdn.net/storage/video_chunk_001.mkv?expires=12345"
+    mock_tunnel_probe = httpx.Response(
+        status_code=302,
+        headers={
+            "Location": cdn_location,
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+    with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as mock_req:
+        mock_req.return_value = mock_tunnel_probe
+        res = client.get(
+            "/dav/usr_cdn_test/video_chunk_001.mkv?resolve_cdn=1",
+            headers={"Range": "bytes=0-1024"},
+            follow_redirects=False,
+        )
+        assert res.status_code == 302
+        assert res.headers["Location"] == cdn_location
+        assert res.headers["Range"] == "bytes=0-1024"
+        assert res.headers["Accept-Ranges"] == "bytes"
+
+
+def test_dav_offline_tunnel_error_handling_503():
+    """When tunnel is offline or connection fails, hub returns HTTP 503 with informative body."""
+    client.post("/api/register", json={
+        "user_id": "usr_offline_hub",
+        "tunnel_url": "https://dead-tunnel.trycloudflare.com",
+    })
+
+    with patch("httpx.AsyncClient.request", new_callable=AsyncMock) as mock_req:
+        mock_req.side_effect = httpx.ConnectError("Connection to tunnel refused")
+
+        # 1. WebDAV request (XML response)
+        res_dav = client.request("PROPFIND", "/dav/usr_offline_hub/", follow_redirects=False)
+        assert res_dav.status_code == 503
+        assert "application/xml" in res_dav.headers.get("content-type", "")
+        assert "<status>offline</status>" in res_dav.text
+        assert "Cloud Shell tunnel is offline" in res_dav.text
+
+        # 2. API / JSON client request
+        res_json = client.request(
+            "PROPFIND",
+            "/dav/usr_offline_hub/",
+            headers={"Accept": "application/json"},
+            follow_redirects=False,
+        )
+        assert res_json.status_code == 503
+        data = res_json.json()
+        assert data["status"] == "offline"
+        assert data["user_id"] == "usr_offline_hub"
+        assert "dead-tunnel.trycloudflare.com" in data["tunnel_url"]
+
+        # 3. Plain text client request
+        res_text = client.request(
+            "PROPFIND",
+            "/dav/usr_offline_hub/",
+            headers={"Accept": "text/plain"},
+            follow_redirects=False,
+        )
+        assert res_text.status_code == 503
+        assert "text/plain" in res_text.headers.get("content-type", "")
+        assert "Cloud Shell tunnel is offline" in res_text.text
+
+
+def test_dav_dormant_and_expired_json_handling_503():
+    """Dormant or expired users requesting JSON receive HTTP 503 JSON responses."""
+    # Dormant user
+    res_dormant_json = client.get(
+        "/dav/nobody_here/file.mkv",
+        headers={"Accept": "application/json"},
+        follow_redirects=False,
+    )
+    assert res_dormant_json.status_code == 503
+    assert res_dormant_json.json()["status"] == "dormant"
+
+    # Expired user
+    registry.register(user_id="usr_quick_expire", tunnel_url="https://temp.trycloudflare.com", ttl_sec=1)
+    with patch("time.time", return_value=time.time() + 100):
+        res_expired_json = client.get(
+            "/dav/usr_quick_expire/file.mkv",
+            headers={"Accept": "application/json"},
+            follow_redirects=False,
+        )
+        assert res_expired_json.status_code == 503
+        assert res_expired_json.json()["status"] == "expired"

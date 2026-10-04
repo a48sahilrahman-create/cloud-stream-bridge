@@ -13,7 +13,7 @@ import os
 import json
 import base64
 import email.utils
-from urllib.parse import unquote, quote
+from urllib.parse import unquote, quote, urlsplit
 from xml.sax.saxutils import escape
 from typing import Dict, Any, Optional
 from starlette.requests import Request
@@ -23,6 +23,20 @@ from range_proxy import stream_range_proxy
 def xml_escape(val: Any) -> str:
     """Escape special characters (&, <, >, \", ') for safe XML injection."""
     return escape(str(val), {'"': "&quot;", "'": "&apos;"})
+
+def clean_relative_path(path_or_url: str) -> str:
+    """
+    Ensure WebDAV path is always a clean relative path (/dav/...) without
+    scheme or host, preventing broken http:// URLs when behind an HTTPS tunnel (RFC 4918 §8.3).
+    """
+    if not path_or_url:
+        return "/"
+    str_val = str(path_or_url).strip()
+    if str_val.startswith(("http://", "https://", "//")):
+        str_val = urlsplit(str_val).path or "/"
+    if not str_val.startswith("/"):
+        str_val = "/" + str_val
+    return str_val
 
 # Mount registry store
 MOUNTS_DB_PATH = os.environ.get("MOUNTS_DB_PATH", os.path.join(os.path.dirname(__file__), "mounts.json"))
@@ -113,6 +127,7 @@ def format_http_date(timestamp: float) -> str:
 
 
 def _build_file_propstat(mount: Dict[str, Any], base_path: str) -> list:
+    base_path = clean_relative_path(base_path)
     filename = mount["filename"]
     safe_filename = xml_escape(filename)
     total_bytes = mount.get("total_bytes", 0)
@@ -153,7 +168,9 @@ def build_propfind_xml(base_path: str, depth: str = "1", target_file: Optional[D
     """
     Generates standard WebDAV XML Multi-Status response (RFC 4918).
     CX File Explorer uses this to display folder contents and file sizes.
+    Ensures all <D:href> values use clean relative paths (/dav/...).
     """
+    base_path = clean_relative_path(base_path)
     if target_file is not None:
         xml_lines = [
             '<?xml version="1.0" encoding="utf-8"?>',
@@ -203,10 +220,11 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
     method = request.method.upper()
     path = path.strip("/")
 
-    # Dynamically determine base_dav_path
-    raw_path = str(request.url.path).rstrip("/") + "/"
-    base_dav_path = raw_path if not path else "/" + "/".join(str(request.url.path).strip("/").split("/")[:-1]).rstrip("/") + "/"
-    if str(request.url.path) == "/" or base_dav_path == "//":
+    # Dynamically determine base_dav_path ensuring clean relative path (/dav/ or /)
+    req_path = clean_relative_path(str(request.url.path))
+    raw_path = req_path.rstrip("/") + "/"
+    base_dav_path = raw_path if not path else "/" + "/".join(req_path.strip("/").split("/")[:-1]).rstrip("/") + "/"
+    if req_path == "/" or base_dav_path == "//":
         base_dav_path = "/"
 
     # 0. Basic Authentication Validation (Optional via env)
@@ -270,7 +288,7 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
 
     # 3. PROPPATCH Method (Property update acknowledgement)
     if method == "PROPPATCH":
-        target_path = xml_escape(str(request.url.path))
+        target_path = xml_escape(clean_relative_path(str(request.url.path)))
         proppatch_xml = (
             '<?xml version="1.0" encoding="utf-8"?>\n'
             '<D:multistatus xmlns:D="DAV:">\n'
@@ -313,6 +331,18 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
 
     # 4. HEAD Method
     if method == "HEAD":
+        if request.query_params.get("redirect") == "1" and upstream_url:
+            return RedirectResponse(
+                url=upstream_url,
+                status_code=302,
+                headers={
+                    "Location": upstream_url,
+                    "Accept-Ranges": "bytes",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Expose-Headers": "Location, Content-Range, Accept-Ranges",
+                    "Cache-Control": "no-cache, no-store, must-revalidate"
+                }
+            )
         headers = {
             "Accept-Ranges": "bytes",
             "Content-Type": content_type,

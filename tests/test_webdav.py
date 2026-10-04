@@ -562,6 +562,91 @@ def test_webdav_special_characters_filename():
         mount_manager.remove_mount(filename)
 
 
+def test_webdav_href_clean_relative_paths():
+    """
+    Verify all <D:href> values use clean relative paths (/dav/...) and never emit
+    broken http:// URLs even when base_path contains scheme/domain or behind reverse proxies.
+    """
+    from webdav_engine import clean_relative_path
+
+    # Unit checks on clean_relative_path
+    assert clean_relative_path("http://tunnel.koyeb.app/dav/") == "/dav/"
+    assert clean_relative_path("https://tunnel.koyeb.app/dav") == "/dav"
+    assert clean_relative_path("http://localhost:7860/") == "/"
+    assert clean_relative_path("/dav/") == "/dav/"
+    assert clean_relative_path("dav/") == "/dav/"
+
+    mount_manager.add_mount(
+        movie_id="href_test",
+        filename="CleanPathMovie.mkv",
+        upstream_url="https://example.com/clean.mkv",
+        total_bytes=1000,
+        content_type="video/x-matroska",
+        formatted_size="1 KB"
+    )
+    try:
+        # 1. build_propfind_xml with an absolute http URL must strip domain and scheme
+        xml_out = build_propfind_xml("http://tunnel.koyeb.app/dav/", depth="1")
+        assert "http://" not in xml_out
+        assert "<D:href>/dav/</D:href>" in xml_out
+        assert "<D:href>/dav/CleanPathMovie.mkv</D:href>" in xml_out
+
+        # 2. PROPFIND with X-Forwarded-Proto and X-Forwarded-Host headers
+        headers = {
+            "Depth": "1",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "my-bridge.example.com",
+            "Host": "my-bridge.example.com"
+        }
+        resp = client.request("PROPFIND", "/dav/", headers=headers)
+        assert resp.status_code == 207
+        assert "http://" not in resp.text
+        assert "<D:href>/dav/</D:href>" in resp.text
+        assert "<D:href>/dav/CleanPathMovie.mkv</D:href>" in resp.text
+    finally:
+        mount_manager.remove_mount("CleanPathMovie.mkv")
+
+
+def test_webdav_redirect_preserves_query_params_no_double_escape():
+    """
+    Verify GET and HEAD redirects format Location header accurately without
+    double-escaping pre-encoded query parameters (e.g. %20, %3B, %22, %2B, %3D).
+    """
+    presigned_url = (
+        "https://pub-abc.r2.dev/stream"
+        "?response-content-disposition=attachment%3B%20filename%3D%22Movie%20Title%20%5B2024%5D.mkv%22"
+        "&X-Amz-Signature=abc%2Bdef%2F123%3D"
+    )
+    mount_manager.add_mount(
+        movie_id="redirect_param_test",
+        filename="RedirectTest.mkv",
+        upstream_url=presigned_url,
+        total_bytes=5000,
+        content_type="video/x-matroska",
+        formatted_size="5 KB"
+    )
+    try:
+        # 1. GET redirect to upstream presigned URL
+        resp_get = client.get("/dav/RedirectTest.mkv", follow_redirects=False)
+        assert resp_get.status_code == 302
+        loc_header = resp_get.headers.get("Location")
+        assert loc_header == presigned_url
+        assert "%2520" not in loc_header  # Must NOT double-escape %20 to %2520
+        assert "%253B" not in loc_header  # Must NOT double-escape %3B to %253B
+
+        # 2. HEAD redirect when ?redirect=1
+        resp_head_redir = client.head("/dav/RedirectTest.mkv?redirect=1", follow_redirects=False)
+        assert resp_head_redir.status_code == 302
+        assert resp_head_redir.headers.get("Location") == presigned_url
+
+        # 3. Standard HEAD without redirect=1 returns 200 with accurate metadata
+        resp_head_std = client.head("/dav/RedirectTest.mkv")
+        assert resp_head_std.status_code == 200
+        assert resp_head_std.headers.get("Content-Length") == "5000"
+    finally:
+        mount_manager.remove_mount("RedirectTest.mkv")
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

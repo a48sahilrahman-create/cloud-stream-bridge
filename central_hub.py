@@ -368,6 +368,122 @@ async def forward_unmount_all_request(user_id: str):
         return JSONResponse(status_code=502, content={"error": f"Failed to unmount all: {str(exc)}", "status": "error"})
 
 
+def rewrite_single_href(url: str, tunnel_url: str, user_id: str) -> str:
+    """
+    Rewrite a single URL from an upstream WebDAV XML href.
+    - If URL points to temporary tunnel_url, rewrite to permanent /dav/{user_id}/...
+    - If URL is relative to /dav/, prefix with user_id (/dav/{user_id}/...)
+    - Preserves URLs that already contain /dav/{user_id}/ or external URLs.
+    """
+    url_stripped = url.strip()
+    clean_tunnel = tunnel_url.strip().rstrip("/")
+    hub_prefix = f"/dav/{user_id}"
+
+    # Candidate tunnel base URLs (support https and http)
+    tunnels = [clean_tunnel]
+    if clean_tunnel.startswith("https://"):
+        tunnels.append("http://" + clean_tunnel[8:])
+    elif clean_tunnel.startswith("http://"):
+        tunnels.append("https://" + clean_tunnel[7:])
+
+    for t in tunnels:
+        if url_stripped.startswith(t):
+            remainder = url_stripped[len(t):]
+            if remainder.startswith("/dav"):
+                remainder = remainder[4:]
+            if not remainder.startswith("/"):
+                remainder = "/" + remainder if remainder else "/"
+            return f"{hub_prefix}{remainder}"
+
+    # Handle upstream relative paths starting with /dav/
+    if url_stripped.startswith("/dav/") and not url_stripped.startswith(f"/dav/{user_id}/"):
+        remainder = url_stripped[len("/dav/"):]
+        return f"{hub_prefix}/{remainder}"
+    elif url_stripped == "/dav":
+        return f"{hub_prefix}/"
+
+    return url
+
+
+def rewrite_webdav_hrefs(xml_content: str, tunnel_url: str, user_id: str) -> str:
+    """
+    Scan XML payload and rewrite any <D:href> (or <href>) URLs containing
+    tunnel_url or relative /dav/ paths to point to permanent hub URLs (/dav/{user_id}/...).
+    """
+    pattern = re.compile(
+        r"(<(?P<tag>(?:[A-Za-z0-9_-]+:)?href)\b[^>]*>)(.*?)(</(?P=tag)>)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace_href(match: re.Match) -> str:
+        open_tag = match.group(1)
+        raw_url = match.group(3)
+        close_tag = match.group(4)
+        rewritten = rewrite_single_href(raw_url, tunnel_url, user_id)
+        return f"{open_tag}{rewritten}{close_tag}"
+
+    return pattern.sub(_replace_href, xml_content)
+
+
+def make_offline_error_response(
+    user_id: str,
+    exc: Exception,
+    request: Request,
+    tunnel_url: Optional[str] = None,
+) -> Response:
+    """
+    Return robust HTTP 503 with informative JSON, text, or XML when Cloud Shell tunnel is offline or expired.
+    """
+    error_msg = f"Cloud Shell tunnel is offline or unreachable: {str(exc)}"
+    accept = request.headers.get("accept", "").lower()
+
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*",
+        "DAV": "1",
+        "Retry-After": "10",
+    }
+
+    if "application/json" in accept:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": error_msg,
+                "status": "offline",
+                "user_id": user_id,
+                "tunnel_url": tunnel_url,
+            },
+            headers=headers,
+        )
+
+    if "text/plain" in accept:
+        return Response(
+            content=error_msg,
+            status_code=503,
+            media_type="text/plain; charset=utf-8",
+            headers=headers,
+        )
+
+    # Standard WebDAV XML error response for CX File Explorer & other DAV clients
+    escaped_msg = xml_escape(error_msg)
+    escaped_uid = xml_escape(user_id)
+    xml_body = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<error>\n'
+        f'  <message>{escaped_msg}</message>\n'
+        '  <status>offline</status>\n'
+        f'  <user_id>{escaped_uid}</user_id>\n'
+        '</error>'
+    )
+    return Response(
+        content=xml_body,
+        status_code=503,
+        media_type="application/xml; charset=utf-8",
+        headers=headers,
+    )
+
+
 @app.api_route(
     "/dav/{user_id}",
     methods=["GET", "HEAD", "PROPFIND", "OPTIONS", "PROPPATCH", "MKCOL", "DELETE", "POST", "PUT"],
@@ -383,25 +499,67 @@ async def forward_unmount_all_request(user_id: str):
 async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
     """
     Central WebDAV entry point for CX File Explorer and media players.
-    - If user is inactive or not found: returns HTTP 503 with XML body.
+    - If user is inactive or expired: returns HTTP 503 with informative XML/JSON/text body.
     - WebDAV metadata/directory queries (PROPFIND, OPTIONS, PROPPATCH, MKCOL, DELETE):
       Reverse-proxies directly to active Cloud Shell tunnel to avoid client redirect failure.
-    - Media streaming (GET, HEAD): returns HTTP 302 Found redirect to target Cloud Shell tunnel,
-      preserving query string, enabling direct client-to-Cloud-Shell streaming (zero video byte proxying).
+      Rewrites any <D:href> (or <href>) URLs in XML responses that contain tunnel_url so they
+      point to permanent hub URLs (/dav/{user_id}/...).
+    - Media streaming (GET, HEAD):
+      * Direct 302 redirect to tunnel preserves Range headers (Accept-Ranges: bytes, Range in response,
+        Access-Control-Expose-Headers) and all query parameters (token, seek, range, proxy flags).
+      * Direct CDN Resolution: If tunnel can directly return upstream CDN 302 (requested via resolve_cdn=1,
+        resolve=1, direct_cdn=1, x-resolve-cdn header, or RESOLVE_CDN_REDIRECT env), the hub queries
+        the tunnel and redirects the client cleanly to the upstream CDN without unnecessary intermediate hops.
+      * Robust error handling: Returns HTTP 503 with informative JSON/text/XML when tunnel is offline.
     """
     uid = user_id.strip()
     if not registry.is_active(uid):
-        logger.info("WebDAV access attempted for dormant user %s (%s)", uid, request.method)
+        logger.info("WebDAV access attempted for dormant/expired user %s (%s)", uid, request.method)
+        entry = registry.get(uid)
+        is_expired = entry is not None and not registry.is_active(uid)
+        accept = request.headers.get("accept", "").lower()
+
+        headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+            "DAV": "1",
+        }
+
+        if "application/json" in accept:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": (
+                        f"Cloud Shell session has expired for user '{uid}'. Please re-run your Cloud Shell runner to reactivate."
+                        if is_expired
+                        else f"Cloud Shell is dormant for user '{uid}'. Run your command in Google Cloud Shell to activate."
+                    ),
+                    "status": "expired" if is_expired else "dormant",
+                    "user_id": uid,
+                    "active": False,
+                },
+                headers=headers,
+            )
+
+        if "text/plain" in accept:
+            msg = (
+                f"Cloud Shell session expired for user '{uid}'."
+                if is_expired
+                else f"Cloud Shell is dormant for user '{uid}'."
+            )
+            return Response(
+                content=msg,
+                status_code=503,
+                media_type="text/plain; charset=utf-8",
+                headers=headers,
+            )
+
         return Response(
             content=DORMANT_XML_RESPONSE,
             status_code=503,
             media_type="application/xml; charset=utf-8",
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "*",
-                "Access-Control-Allow-Headers": "*",
-                "DAV": "1",
-            },
+            headers=headers,
         )
 
     entry = registry.get(uid)
@@ -431,7 +589,31 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
                     headers=fwd_headers,
                     content=body,
                 )
+
+                # Check if tunnel returned a gateway failure or dead Cloudflare tunnel HTML page
+                if resp.status_code in (502, 503, 504) and (
+                    b"<html" in resp.content.lower() or "text/html" in resp.headers.get("content-type", "")
+                ):
+                    logger.warning("Upstream tunnel %s returned HTTP %s HTML (offline)", target_url, resp.status_code)
+                    return make_offline_error_response(
+                        uid,
+                        Exception(f"Upstream Cloud Shell tunnel is offline (HTTP {resp.status_code})"),
+                        request,
+                        tunnel_url=tunnel_url,
+                    )
+
                 media_type = resp.headers.get("content-type", "application/xml; charset=utf-8")
+                content = resp.content
+
+                # Rewrite <D:href> URLs in XML responses that contain tunnel_url or relative /dav/ paths
+                if content and ("xml" in media_type.lower() or content.strip().startswith(b"<?xml") or b"<" in content):
+                    try:
+                        decoded = content.decode("utf-8")
+                        rewritten = rewrite_webdav_hrefs(decoded, tunnel_url, uid)
+                        content = rewritten.encode("utf-8")
+                    except Exception as rewrite_err:
+                        logger.warning("Error rewriting XML hrefs for %s: %s", uid, rewrite_err)
+
                 response_headers = {
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Methods": "*",
@@ -442,37 +624,68 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
                     if header_name in resp.headers:
                         response_headers[header_name] = resp.headers[header_name]
 
+                if "location" in resp.headers:
+                    response_headers["Location"] = rewrite_single_href(resp.headers["location"], tunnel_url, uid)
+
                 return Response(
-                    content=resp.content,
+                    content=content,
                     status_code=resp.status_code,
                     media_type=media_type,
                     headers=response_headers,
                 )
         except Exception as exc:
             logger.error("WebDAV proxy %s to %s failed: %s", request.method, target_url, exc)
-            return Response(
-                content=f'<?xml version="1.0" encoding="utf-8"?><error><message>WebDAV proxy error: {str(exc)}</message></error>',
-                status_code=502,
-                media_type="application/xml; charset=utf-8",
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "*",
-                    "Access-Control-Allow-Headers": "*",
-                    "DAV": "1",
-                },
-            )
+            return make_offline_error_response(uid, exc, request, tunnel_url=tunnel_url)
 
-    # Media streaming (GET, HEAD): 302 Found redirect preserving zero video proxying
+    # Media streaming (GET, HEAD): HTTP 302 Found redirect preserving zero video proxying
+    client_range = request.headers.get("range")
+    redirect_headers = {
+        "Location": target_url,
+        "Accept-Ranges": "bytes",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "Location, Range, Content-Range, Accept-Ranges",
+        "DAV": "1",
+    }
+    if client_range:
+        redirect_headers["Range"] = client_range
+
+    # Clean CDN Direct Mode: If requested, query tunnel to return upstream CDN 302 directly without unnecessary hops
+    should_resolve_cdn = (
+        request.query_params.get("resolve_cdn") == "1"
+        or request.query_params.get("resolve") == "1"
+        or request.query_params.get("direct_cdn") == "1"
+        or request.headers.get("x-resolve-cdn") == "1"
+        or os.environ.get("RESOLVE_CDN_REDIRECT") == "1"
+    )
+    if should_resolve_cdn and clean_path:
+        fwd_headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ("host", "content-length")
+        }
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                tunnel_probe = await client.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=fwd_headers,
+                    follow_redirects=False,
+                )
+                if tunnel_probe.status_code in (301, 302, 307, 308) and "location" in tunnel_probe.headers:
+                    cdn_url = tunnel_probe.headers["location"]
+                    logger.info("Direct CDN 302 resolution: user %s -> %s", uid, cdn_url)
+                    cdn_headers = dict(redirect_headers)
+                    cdn_headers["Location"] = cdn_url
+                    return Response(status_code=302, headers=cdn_headers)
+        except Exception as exc:
+            logger.error("Failed to query tunnel for CDN 302 (%s): %s", target_url, exc)
+            return make_offline_error_response(uid, exc, request, tunnel_url=tunnel_url)
+
     logger.debug("Redirecting %s %s -> %s", request.method, request.url.path, target_url)
     return Response(
         status_code=302,
-        headers={
-            "Location": target_url,
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "*",
-            "Access-Control-Allow-Headers": "*",
-            "DAV": "1",
-        },
+        headers=redirect_headers,
     )
 
 
