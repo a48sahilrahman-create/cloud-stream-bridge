@@ -7,6 +7,7 @@ local_tunnel.log
 server.log
 tunnel.log
 mounts.json
+library_vault.json
 .pytest_cache/
 .coverage
 htmlcov/
@@ -35,4 +36,6 @@ repomix-output.xml
 .bin/
 .vscode/
 .idea/
+.wrangler/
+node_modules/
 

@@ -8,6 +8,7 @@ Detects:
 """
 
 import time
+import asyncio
 import httpx
 import re
 from urllib.parse import urlparse, parse_qs, unquote
@@ -20,6 +21,66 @@ VIDEO_EXTENSIONS = (
     ".mkv", ".mp4", ".ts", ".avi", ".mov", ".webm",
     ".m4v", ".flv", ".wmv", ".iso", ".mpg", ".mpeg", ".vob", ".m3u8"
 )
+
+# Global Real-Time Probe Registry & Shield Events
+probe_tracker: Dict[str, Dict[str, Any]] = {}
+probe_events: Dict[str, asyncio.Event] = {}
+
+def get_probe_event(key: str) -> asyncio.Event:
+    """Return or create an asyncio.Event for a given probe_id or filename."""
+    if key not in probe_events:
+        probe_events[key] = asyncio.Event()
+    return probe_events[key]
+
+def register_probe(key: str) -> asyncio.Event:
+    """Register or reset an asyncio.Event for an in-flight probe."""
+    evt = get_probe_event(key)
+    evt.clear()
+    return evt
+
+def complete_probe(key: str):
+    """Mark an in-flight probe as completed and wake any awaiting WebDAV clients."""
+    if key in probe_events:
+        probe_events[key].set()
+
+def is_probe_active(key: str) -> bool:
+    """Check if a probe is currently in-flight and not yet resolved."""
+    if key in probe_events:
+        return not probe_events[key].is_set()
+    return False
+
+def count_active_probes() -> int:
+    """Return count of currently in-flight probes."""
+    return sum(1 for evt in probe_events.values() if not evt.is_set())
+
+def set_probe_stage(probe_id: Optional[str], stage: str, percent: int, label: str, extra: Optional[Dict[str, Any]] = None):
+    """Update active probe telemetry stages (0% -> 25% -> 60% -> 85% -> 100%)."""
+    if not probe_id:
+        return
+    now = time.time()
+    existing = probe_tracker.get(probe_id, {
+        "probe_id": probe_id,
+        "start_time": now,
+        "stage": stage,
+        "percent": percent,
+        "label": label,
+        "done": False,
+        "error": None
+    })
+    existing.update({
+        "stage": stage,
+        "percent": percent,
+        "label": label,
+        "updated_at": now,
+        "elapsed_sec": round(now - existing.get("start_time", now), 2)
+    })
+    if extra:
+        existing.update(extra)
+    probe_tracker[probe_id] = existing
+
+def get_probe_status(probe_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve live probe stage dictionary."""
+    return probe_tracker.get(probe_id)
 
 
 def sanitize_filename(name: str) -> str:
@@ -115,7 +176,11 @@ def extract_filename(
     return f"stream_{int(time.time())}{ext}"
 
 
-async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+async def probe_stream(
+    url: str,
+    probe_id: Optional[str] = None,
+    custom_headers: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
     """
     Probes an upstream stream/download link with a multi-tier resilience cascade:
       Tier 1: Range GET (bytes=0-8191) with modern browser headers.
@@ -124,6 +189,10 @@ async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None
     Never raises unhandled exceptions; returns clean metadata dictionary.
     """
     t0 = time.perf_counter()
+    set_probe_stage(probe_id, "init", 0, "Initializing Stream Probe")
+    evt = get_probe_event(probe_id) if probe_id else None
+    if evt:
+        evt.clear()
 
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}" if (parsed.scheme and parsed.netloc) else ""
@@ -182,6 +251,7 @@ async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None
                     accept_ranges = resp.headers.get("accept-ranges", "").lower()
 
                     if status_code in (200, 206):
+                        set_probe_stage(probe_id, "redirects", 25, "Resolving Redirects & CDN Origin", {"final_url": final_url})
                         async for chunk in resp.aiter_bytes():
                             data += chunk
                             if len(data) >= 8192:
@@ -281,6 +351,8 @@ async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
+        set_probe_stage(probe_id, "container", 60, "Inspecting Container & Magic Bytes")
+
         # Parse total size
         total_bytes = 0
         if content_range and "/" in content_range:
@@ -293,6 +365,8 @@ async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None
                 total_bytes = int(content_length)
             except ValueError:
                 pass
+
+        set_probe_stage(probe_id, "size_lock", 85, "Locking Byte-Range & File Size", {"total_bytes": total_bytes})
 
         # Optimistic streaming capability:
         # If total_bytes == 0 or range is not explicitly advertised, mark range_supported = True
@@ -370,6 +444,17 @@ async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None
         url_filename = extract_filename(final_url, resp_headers, ext=ext, fallback_url=url)
 
         is_valid = (status_code in [200, 206])
+        set_probe_stage(probe_id, "ready", 100, "Ready for CX File Explorer", {
+            "total_bytes": total_bytes,
+            "formatted_size": formatted_size,
+            "container_format": container_format,
+            "filename": url_filename,
+            "done": True,
+            "valid": is_valid
+        })
+        if evt:
+            evt.set()
+
         return {
             "valid": is_valid,
             "status_code": status_code,
@@ -386,6 +471,15 @@ async def probe_stream(url: str, custom_headers: Optional[Dict[str, str]] = None
 
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        set_probe_stage(probe_id, "ready", 100, "Ready in Fallback Mode", {
+            "total_bytes": 0,
+            "formatted_size": "Dynamic Stream",
+            "done": True,
+            "error": str(e),
+            "valid": False
+        })
+        if evt:
+            evt.set()
         return {
             "valid": False,
             "status_code": status_code or 0,

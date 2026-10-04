@@ -56,10 +56,12 @@ def test_main_api_register():
     assert data["tunnel_url"] == "https://device-99.trycloudflare.com"
     assert data["active"] is True
 
-    # Check status endpoint
-    res_status = client.get("/api/status/device_user_99")
-    assert res_status.status_code == 200
-    assert res_status.json()["active"] is True
+    # Check status endpoint with active probe returning 200
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = httpx.Response(200, json={"status": "online"})
+        res_status = client.get("/api/status/device_user_99")
+        assert res_status.status_code == 200
+        assert res_status.json()["active"] is True
 
 
 def test_main_api_heartbeat():

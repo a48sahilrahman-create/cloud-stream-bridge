@@ -91,7 +91,20 @@ async def stream_range_proxy(
     """
     Creates an optimized StreamingResponse for the requested byte range.
     Translates player seek ranges directly to upstream HTTP Range calls.
+    Includes 0-Byte Guard to prevent CX File Explorer 1-byte demuxer hang.
     """
+    if total_size <= 0:
+        logger.warning(f"0-Byte Guard Triggered: total_size is {total_size} for {upstream_url}. Returning 503 Retry-After.")
+        return Response(
+            content="Stream size not yet verified or active probe in progress. Please retry in 2 seconds.",
+            status_code=503,
+            headers={
+                "Retry-After": "2",
+                "Content-Type": "text/plain; charset=utf-8",
+                "Cache-Control": "no-cache, no-store, must-revalidate"
+            }
+        )
+
     telemetry_stats["total_requests_served"] += 1
     start, end = parse_byte_range(range_header, total_size)
     content_length = (end - start + 1) if (end >= start and total_size > 0) else None
@@ -124,17 +137,26 @@ async def stream_range_proxy(
     async def chunk_generator() -> AsyncGenerator[bytes, None]:
         telemetry_stats["active_streams"] += 1
         client = get_shared_client()
+        resp = None
         try:
-            async with client.stream("GET", upstream_url, headers=upstream_req_headers) as resp:
-                async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
-                    telemetry_stats["total_bytes_streamed"] += len(chunk)
-                    yield chunk
+            resp = await client.send(
+                client.build_request("GET", upstream_url, headers=upstream_req_headers),
+                stream=True
+            )
+            async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
+                telemetry_stats["total_bytes_streamed"] += len(chunk)
+                yield chunk
         except (asyncio.CancelledError, GeneratorExit):
             # Client scrubbed timeline / aborted playback — trap and clean up immediately
             logger.info(f"Client disconnected / scrubbed: range {start}-{end}")
         except Exception as e:
             logger.error(f"Upstream stream error: {e}")
         finally:
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
             telemetry_stats["active_streams"] = max(0, telemetry_stats["active_streams"] - 1)
 
     return StreamingResponse(

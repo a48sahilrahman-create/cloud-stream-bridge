@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudstream-dav-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-04",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "RENDER_HUB_URL": "https://cloud-stream-bridge.onrender.com"
+  }
+}

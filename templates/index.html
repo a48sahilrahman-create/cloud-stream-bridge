@@ -29,9 +29,15 @@
           <p class="text-xs sm:text-sm text-slate-400">Watch 100 GB Remuxes on 50 Mbps Wi-Fi • 0 Bytes Local Disk</p>
         </div>
       </div>
-      <div class="flex items-center space-x-2 text-xs bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-full font-medium">
-        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-        <span>Bridge Active & Ready</span>
+      <div class="flex items-center gap-3">
+        <button onclick="openVaultModal()" class="flex items-center space-x-2 text-xs bg-indigo-900/60 hover:bg-indigo-800 border border-indigo-700/60 text-indigo-200 px-3.5 py-1.5 rounded-xl font-medium shadow-md transition">
+          <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
+          <span>Library Vault (GitHub Sync)</span>
+        </button>
+        <div class="flex items-center space-x-2 text-xs bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-full font-medium">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+          <span>Bridge Active & Ready</span>
+        </div>
       </div>
     </header>
 
@@ -59,12 +65,12 @@
       </div>
     </section>
 
-    <!-- Main Mounting Card -->
+    <!-- Main Mounting Card with Real-Time Readiness Tracker -->
     <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 sm:p-6 shadow-xl space-y-4">
       <div class="flex items-center justify-between">
         <div>
           <h2 class="text-base sm:text-lg font-semibold text-white">Mount Massive Movie Link</h2>
-          <p class="text-xs text-slate-400">Paste any direct download or CDN stream link. The cloud probes it in &lt;100ms.</p>
+          <p class="text-xs text-slate-400">Paste any direct download or CDN stream link. The cloud inspects container magic bytes and locks size.</p>
         </div>
       </div>
 
@@ -74,21 +80,49 @@
           <input id="stream-url" type="url" required placeholder="https://example.com/movies/Oppenheimer.2023.UHD.Remux.mkv"
             class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition">
         </div>
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <div class="sm:col-span-2 space-y-1">
+        <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
+          <div class="sm:col-span-7 space-y-1">
             <label class="text-xs font-medium text-slate-300">Custom Title (Optional)</label>
             <input id="stream-title" type="text" placeholder="e.g. Oppenheimer (4K UHD Remux)"
               class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition">
           </div>
-          <div class="flex items-end">
+          <div class="sm:col-span-5 flex items-end gap-2">
             <button id="mount-btn" type="submit"
-              class="w-full bg-gradient-to-r from-indigo-600 to-cyan-500 hover:from-indigo-500 hover:to-cyan-400 text-white font-semibold text-sm py-2.5 px-4 rounded-xl shadow-lg shadow-indigo-600/20 flex items-center justify-center space-x-2 transition disabled:opacity-50">
+              class="flex-1 bg-gradient-to-r from-indigo-600 to-cyan-500 hover:from-indigo-500 hover:to-cyan-400 text-white font-semibold text-sm py-2 px-3 rounded-xl shadow-lg shadow-indigo-600/20 flex items-center justify-center space-x-1.5 transition disabled:opacity-50">
               <svg id="btn-icon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-              <span id="btn-text">Mount Virtual WebDAV (<100ms)</span>
+              <span id="btn-text">Mount Stream</span>
+            </button>
+            <button id="save-vault-btn" type="button" onclick="saveCurrentToVault()"
+              class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs py-2.5 px-3 rounded-xl transition flex items-center gap-1" title="Save to Library Vault without immediate mount">
+              <span>+ Save to Vault</span>
             </button>
           </div>
         </div>
       </form>
+
+      <!-- Multi-Stage Real-Time Readiness Tracker Dashboard -->
+      <div id="probe-meter-card" class="hidden p-4 rounded-xl border border-indigo-500/30 bg-indigo-950/30 space-y-3">
+        <div class="flex items-center justify-between text-xs">
+          <div class="flex items-center space-x-2">
+            <span id="probe-spinner" class="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-ping"></span>
+            <span id="probe-stage-label" class="font-semibold text-indigo-200">Initializing Stream Probe...</span>
+          </div>
+          <span id="probe-percent-label" class="font-mono font-bold text-cyan-300">0%</span>
+        </div>
+        <div class="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800">
+          <div id="probe-progress-bar" class="bg-gradient-to-r from-indigo-500 via-cyan-400 to-emerald-400 h-2 rounded-full transition-all duration-300 w-0"></div>
+        </div>
+        <div class="grid grid-cols-4 gap-1 text-[10px] text-slate-400 font-mono text-center">
+          <span id="step-0" class="text-indigo-400 font-semibold">1. Init (0%)</span>
+          <span id="step-25" class="text-slate-500">2. Redirects (25%)</span>
+          <span id="step-60" class="text-slate-500">3. Container (60%)</span>
+          <span id="step-100" class="text-slate-500">4. Ready (100%)</span>
+        </div>
+        <div class="text-[11px] text-slate-400 flex items-center gap-1.5 pt-1 border-t border-slate-800/80">
+          <svg class="w-3.5 h-3.5 text-cyan-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+          <span><strong>WebDAV Probe Shield Active:</strong> Client requests are held or 503-protected so CX File Explorer never encounters a 0-byte corrupt stream.</span>
+        </div>
+      </div>
 
       <!-- Mount Status Notice -->
       <div id="mount-feedback" class="hidden p-3 rounded-xl text-xs border"></div>
@@ -102,7 +136,7 @@
             <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>
             CX File Explorer WebDAV Configuration (Android TV / Phone)
           </h2>
-          <p class="text-xs text-slate-400">Open CX File Explorer &gt; Network &gt; New Location (+) &gt; Remote &gt; WebDAV • <span class="text-emerald-400 font-medium">For Koyeb: Check Anonymous &amp; set Path to /dav</span></p>
+          <p class="text-xs text-slate-400">Open CX File Explorer &gt; Network &gt; New Location (+) &gt; Remote &gt; WebDAV • <span class="text-emerald-400 font-medium">Check Anonymous &amp; set Path to /dav</span></p>
         </div>
         <div class="flex items-center gap-2 self-start sm:self-auto flex-wrap">
           <button onclick="copyHostOnly()" class="text-xs bg-indigo-900/60 hover:bg-indigo-800 text-indigo-200 px-3 py-1.5 rounded-lg border border-indigo-700/50 transition flex items-center gap-1.5">
@@ -139,27 +173,97 @@
         </div>
       </div>
 
-      <!-- Prominent Koyeb & Cloud Helper Banner -->
       <div id="cx-helper-banner" class="mt-4 p-3.5 bg-indigo-950/50 border border-indigo-500/30 rounded-xl flex items-start gap-2.5 text-xs text-indigo-200">
         <svg class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
         <div id="cx-helper-text" class="leading-relaxed">
-          <span class="font-bold text-emerald-300">Important for Koyeb &amp; Cloud WebDAV:</span> In CX File Explorer, ensure <span class="bg-indigo-900/90 text-emerald-300 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">Anonymous [X]</span> is checked (no username or password required) and Path is set to <span class="bg-indigo-900/90 text-indigo-200 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">/dav</span>. Port is <span class="font-mono text-white font-semibold">443</span> with <span class="font-mono text-emerald-400 font-semibold">HTTPS (ON)</span>.
+          <span class="font-bold text-emerald-300">CX File Explorer 1-Click Clipboard Ready:</span> Tap <span class="bg-indigo-900/90 text-emerald-300 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">📋 PASTE WEBDAV FROM CLIPBOARD</span> in CX File Explorer to automatically fill Host, Port, Scheme, and Anonymous mode.
         </div>
       </div>
     </section>
 
-    <!-- Active Mounted Movies List -->
+    <!-- Active Mounted Movies List with Readiness Badges -->
     <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 sm:p-6 shadow-xl space-y-4">
       <div class="flex items-center justify-between">
-        <h2 class="text-base sm:text-lg font-semibold text-white">Active Mounted Streams</h2>
-        <button onclick="loadMounts()" class="text-xs text-indigo-400 hover:text-indigo-300 transition">Refresh List</button>
+        <div class="flex items-center space-x-2">
+          <h2 class="text-base sm:text-lg font-semibold text-white">Active Mounted Streams</h2>
+          <span id="mount-count-pill" class="text-xs bg-slate-800 border border-slate-700 text-slate-300 px-2 py-0.5 rounded-full">0</span>
+        </div>
+        <div class="flex items-center space-x-2">
+          <button onclick="unmountAllStreams()" class="text-xs text-rose-400 hover:text-rose-300 transition">Unmount All</button>
+          <span class="text-slate-600">•</span>
+          <button onclick="loadMounts()" class="text-xs text-indigo-400 hover:text-indigo-300 transition">Refresh List</button>
+        </div>
       </div>
       <div id="mounts-list" class="divide-y divide-slate-800 text-sm">
-        <div class="py-8 text-center text-slate-500 text-xs">No streams mounted yet. Paste a link above to start.</div>
+        <div class="py-8 text-center text-slate-500 text-xs">No streams mounted yet. Paste a link above or mount from Library Vault.</div>
       </div>
     </section>
 
-    <!-- QR Code Modal / Popup -->
+    <!-- Library Vault Modal (Stateless Runner Persistence & GitHub Sync) -->
+    <div id="vault-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+      <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full max-h-[90vh] flex flex-col shadow-2xl">
+        <div class="p-5 border-b border-slate-800 flex items-center justify-between">
+          <div class="flex items-center space-x-2.5">
+            <div class="w-8 h-8 rounded-lg bg-indigo-600/30 border border-indigo-500/40 flex items-center justify-center text-indigo-300">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
+            </div>
+            <div>
+              <h3 class="text-base font-bold text-white">CloudStream Library Vault</h3>
+              <p class="text-xs text-slate-400">Save links across virtual environments &amp; batch-mount to new runners</p>
+            </div>
+          </div>
+          <button onclick="closeVaultModal()" class="text-slate-400 hover:text-white p-1">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+          </button>
+        </div>
+
+        <div class="p-5 space-y-4 overflow-y-auto flex-1">
+          <!-- Remote GitHub Gist / JSON Sync -->
+          <div class="bg-slate-950 p-3.5 rounded-xl border border-slate-800 space-y-2">
+            <label class="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+              <svg class="w-3.5 h-3.5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+              <span>Sync from GitHub Gist or Raw JSON URL</span>
+            </label>
+            <div class="flex gap-2">
+              <input id="remote-vault-url" type="url" placeholder="https://raw.githubusercontent.com/.../library.json"
+                class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500">
+              <button onclick="fetchRemoteVault()" id="sync-remote-btn" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition shrink-0">
+                Sync Links
+              </button>
+            </div>
+          </div>
+
+          <!-- Catalog Controls -->
+          <div class="flex items-center justify-between text-xs flex-wrap gap-2">
+            <div class="flex items-center space-x-2">
+              <button onclick="toggleSelectAllVault()" class="text-indigo-400 hover:text-indigo-300">Toggle Select All</button>
+              <span class="text-slate-600">•</span>
+              <button onclick="exportVaultJson()" class="text-slate-400 hover:text-slate-200">Export JSON</button>
+              <span class="text-slate-600">•</span>
+              <label class="text-slate-400 hover:text-slate-200 cursor-pointer">
+                <span>Import JSON</span>
+                <input type="file" id="import-json-file" accept=".json" class="hidden" onchange="importVaultJson(event)">
+              </label>
+            </div>
+            <button onclick="batchMountSelected()" id="batch-mount-btn" class="bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white px-3.5 py-1.5 rounded-xl font-semibold shadow-md transition disabled:opacity-50">
+              🚀 Mount Selected (<span id="selected-vault-count">0</span>)
+            </button>
+          </div>
+
+          <!-- Catalog List -->
+          <div id="vault-items-list" class="divide-y divide-slate-800 text-xs border border-slate-800 rounded-xl bg-slate-950/60 max-h-72 overflow-y-auto">
+            <div class="py-6 text-center text-slate-500">Loading catalog...</div>
+          </div>
+        </div>
+
+        <div class="p-4 border-t border-slate-800 flex justify-between items-center bg-slate-950/60 rounded-b-2xl">
+          <span class="text-xs text-slate-400" id="vault-summary-text">0 items stored in vault</span>
+          <button onclick="closeVaultModal()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-4 py-2 rounded-xl">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- QR Code Modal -->
     <div id="qr-modal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
       <div class="bg-slate-900 border border-slate-700 rounded-2xl p-6 max-w-sm w-full space-y-4 text-center">
         <h3 class="text-base font-bold text-white">Scan with Phone / TV</h3>
@@ -176,7 +280,10 @@
     const isKoyebHost = window.location.hostname.endsWith(".koyeb.app") || window.location.hostname.includes("koyeb.app");
     const currentBaseUrl = (isKoyebHost && window.location.protocol === "http:") ? `https://${window.location.host}` : window.location.origin;
 
-    // Initialize CX Explorer config values
+    let vaultCatalog = [];
+    let selectedVaultIds = new Set();
+    let activePollInterval = null;
+
     document.addEventListener("DOMContentLoaded", () => {
       const url = new URL(window.location.href);
       const isKoyeb = url.hostname.endsWith(".koyeb.app") || url.hostname.includes("koyeb.app");
@@ -191,16 +298,10 @@
         encEl.className = isHttps ? "font-mono text-emerald-400 font-semibold block mt-0.5" : "font-mono text-slate-400 font-semibold block mt-0.5";
       }
 
-      if (isKoyeb) {
-        const helperText = document.getElementById("cx-helper-text");
-        if (helperText) {
-          helperText.innerHTML = '<span class="font-bold text-amber-300">Koyeb Cloud Active:</span> In CX File Explorer, ensure <span class="bg-indigo-900/90 text-emerald-300 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">Anonymous [X]</span> is checked (no username/password needed) and Path is set to <span class="bg-indigo-900/90 text-indigo-200 font-mono font-semibold px-1.5 py-0.5 rounded border border-indigo-700/60">/dav</span>. Port is <span class="font-mono text-white font-semibold">443</span> with <span class="font-mono text-emerald-400 font-semibold">HTTPS (ON)</span>.';
-        }
-      }
-
       loadMounts();
       fetchStatus();
       setInterval(fetchStatus, 3000);
+      setInterval(loadMounts, 5000);
     });
 
     async function fetchStatus() {
@@ -221,23 +322,35 @@
         const res = await fetch("/api/mounts");
         const data = await res.json();
         const container = document.getElementById("mounts-list");
+        const countPill = document.getElementById("mount-count-pill");
+
         if (!data.mounts || data.mounts.length === 0) {
-          container.innerHTML = '<div class="py-8 text-center text-slate-500 text-xs">No streams mounted yet. Paste a link above to start.</div>';
+          container.innerHTML = '<div class="py-8 text-center text-slate-500 text-xs">No streams mounted yet. Paste a link above or mount from Library Vault.</div>';
+          if (countPill) countPill.textContent = "0";
           return;
         }
+
+        if (countPill) countPill.textContent = data.mounts.length;
 
         container.innerHTML = data.mounts.map(m => {
           const davFileUrl = `${currentBaseUrl}/dav/${encodeURIComponent(m.filename)}`;
           const cleanUrl = davFileUrl.replace(/^https?:\/\//, "");
           const vlcAndroidIntent = `intent://${cleanUrl}#Intent;action=android.intent.action.VIEW;type=video/*;scheme=https;end`;
+
+          const isProbing = m.probing || (m.total_bytes <= 0 && m.formatted_size === "Probing...");
+          const statusBadge = isProbing
+            ? `<span class="px-2 py-0.5 bg-amber-950/70 border border-amber-500/40 text-amber-300 text-[10px] font-bold rounded-md animate-pulse">🟡 PROBING (Wait)</span>`
+            : `<span class="px-2 py-0.5 bg-emerald-950/70 border border-emerald-500/40 text-emerald-300 text-[10px] font-bold rounded-md flex items-center gap-1">🟢 100% READY FOR CX FILE EXPLORER</span>`;
+
           return `
             <div class="py-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
               <div class="space-y-1 max-w-xl">
-                <div class="flex items-center space-x-2">
+                <div class="flex items-center space-x-2 flex-wrap gap-y-1">
                   <span class="px-2 py-0.5 bg-indigo-900/60 border border-indigo-700/50 text-indigo-300 text-[10px] font-bold rounded-md uppercase tracking-wider">
-                    ${m.content_type.includes("matroska") ? "MKV 4K" : "MP4"}
+                    ${m.content_type && m.content_type.includes("matroska") ? "MKV 4K" : "MP4"}
                   </span>
-                  <span class="font-semibold text-slate-200 text-sm truncate">${m.title || m.filename}</span>
+                  ${statusBadge}
+                  <span class="font-semibold text-slate-200 text-sm truncate max-w-md">${m.title || m.filename}</span>
                 </div>
                 <div class="text-xs text-slate-400 flex flex-wrap items-center gap-x-3 gap-y-1">
                   <span class="text-emerald-400 font-medium">Virtual Size: ${m.formatted_size}</span>
@@ -268,7 +381,51 @@
       } catch (e) {}
     }
 
-    // Mount form submit handler
+    // Real-Time Multi-Stage Probe Meter updates
+    function setProbeMeter(percent, label, stepId) {
+      const card = document.getElementById("probe-meter-card");
+      card.classList.remove("hidden");
+      document.getElementById("probe-progress-bar").style.width = `${percent}%`;
+      document.getElementById("probe-percent-label").textContent = `${percent}%`;
+      document.getElementById("probe-stage-label").textContent = label;
+
+      ["step-0", "step-25", "step-60", "step-100"].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.className = "text-slate-500";
+      });
+      if (stepId) {
+        const activeEl = document.getElementById(stepId);
+        if (activeEl) activeEl.className = "text-emerald-400 font-bold";
+      }
+    }
+
+    async function pollProbeStatus(probeId) {
+      try {
+        const res = await fetch(`/api/probe/status/${probeId}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === "success" && data.probe) {
+            const p = data.probe;
+            let stepId = "step-0";
+            if (p.percent >= 100) stepId = "step-100";
+            else if (p.percent >= 60) stepId = "step-60";
+            else if (p.percent >= 25) stepId = "step-25";
+
+            setProbeMeter(p.percent, p.label, stepId);
+            if (p.done) {
+              if (activePollInterval) clearInterval(activePollInterval);
+              setTimeout(() => {
+                setProbeMeter(100, "🟢 100% Ready for CX File Explorer", "step-100");
+                loadMounts();
+                fetchStatus();
+              }, 400);
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    // Mount Form Submission
     document.getElementById("mount-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const urlInput = document.getElementById("stream-url");
@@ -277,9 +434,16 @@
       const btnText = document.getElementById("btn-text");
       const feedback = document.getElementById("mount-feedback");
 
+      const probeId = `prb_${Date.now()}`;
       btn.disabled = true;
-      btnText.textContent = "Probing <100ms...";
+      btnText.textContent = "Probing Stream...";
       feedback.className = "hidden";
+
+      setProbeMeter(5, "Initializing Stream Probe...", "step-0");
+
+      activePollInterval = setInterval(() => {
+        pollProbeStatus(probeId);
+      }, 300);
 
       try {
         const res = await fetch("/api/mount", {
@@ -287,14 +451,16 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             url: urlInput.value.trim(),
-            title: titleInput.value.trim() || undefined
+            title: titleInput.value.trim() || undefined,
+            probe_id: probeId
           })
         });
 
         const data = await res.json();
         if (res.ok && data.status === "success") {
+          setProbeMeter(100, "🟢 100% Ready for CX File Explorer", "step-100");
           feedback.className = "p-3 rounded-xl text-xs border bg-emerald-950/60 border-emerald-500/30 text-emerald-300 block";
-          feedback.innerHTML = `✓ <strong>Mounted successfully:</strong> ${data.mount.filename} (${data.mount.formatted_size}) ready on WebDAV in ${data.probe.elapsed_ms}ms.`;
+          feedback.innerHTML = `✓ <strong>Mounted successfully:</strong> ${data.mount.filename} (${data.mount.formatted_size}) ready for instant freeze-free streaming in CX File Explorer.`;
           urlInput.value = "";
           titleInput.value = "";
           loadMounts();
@@ -307,14 +473,246 @@
         feedback.className = "p-3 rounded-xl text-xs border bg-rose-950/60 border-rose-500/30 text-rose-300 block";
         feedback.innerHTML = `✗ <strong>Network error:</strong> ${err.message}`;
       } finally {
+        if (activePollInterval) clearInterval(activePollInterval);
         btn.disabled = false;
-        btnText.textContent = "Mount Virtual WebDAV (<100ms)";
+        btnText.textContent = "Mount Stream";
       }
     });
+
+    async function saveCurrentToVault() {
+      const urlInput = document.getElementById("stream-url");
+      const titleInput = document.getElementById("stream-title");
+      const url = urlInput.value.trim();
+      if (!url) {
+        alert("Please enter a stream URL first.");
+        return;
+      }
+      try {
+        const res = await fetch("/api/library/save-item", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: url,
+            title: titleInput.value.trim() || undefined
+          })
+        });
+        const data = await res.json();
+        if (res.ok && data.status === "success") {
+          alert(`Saved to Library Vault: ${data.item.title}`);
+          urlInput.value = "";
+          titleInput.value = "";
+        }
+      } catch (e) {
+        alert(`Failed to save: ${e.message}`);
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Library Vault Management & Remote Sync
+    // -------------------------------------------------------------
+    async function openVaultModal() {
+      document.getElementById("vault-modal").classList.remove("hidden");
+      await loadVaultCatalog();
+    }
+
+    function closeVaultModal() {
+      document.getElementById("vault-modal").classList.add("hidden");
+    }
+
+    async function loadVaultCatalog() {
+      const listEl = document.getElementById("vault-items-list");
+      listEl.innerHTML = '<div class="py-6 text-center text-slate-500">Loading catalog...</div>';
+      try {
+        const res = await fetch("/api/library/catalog");
+        const data = await res.json();
+        vaultCatalog = data.items || [];
+        document.getElementById("vault-summary-text").textContent = `${vaultCatalog.length} items stored in vault`;
+
+        if (vaultCatalog.length === 0) {
+          listEl.innerHTML = '<div class="py-6 text-center text-slate-500">No items saved in vault yet. Add links or sync from GitHub.</div>';
+          updateSelectedCount();
+          return;
+        }
+
+        listEl.innerHTML = vaultCatalog.map(item => {
+          const isChecked = selectedVaultIds.has(item.id) ? "checked" : "";
+          return `
+            <div class="p-3 flex items-center justify-between gap-3 hover:bg-slate-900/50 transition">
+              <div class="flex items-center space-x-3 overflow-hidden">
+                <input type="checkbox" onchange="toggleVaultSelect('${item.id}', this.checked)" ${isChecked} class="rounded border-slate-700 text-indigo-600 focus:ring-0">
+                <div class="truncate">
+                  <div class="font-medium text-slate-200 truncate">${item.title || "Stream Link"}</div>
+                  <div class="text-[11px] text-slate-500 font-mono truncate max-w-md">${item.url}</div>
+                </div>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <span class="text-[10px] text-cyan-400 font-mono bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-800/40">${item.size_hint || "Stream"}</span>
+                <button onclick="mountSingleVaultItem('${item.id}')" class="bg-indigo-600/80 hover:bg-indigo-500 text-white px-2 py-1 rounded text-[11px] font-medium transition">
+                  Mount
+                </button>
+                <button onclick="deleteVaultItem('${item.id}')" class="text-rose-400 hover:text-rose-300 p-1">
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                </button>
+              </div>
+            </div>
+          `;
+        }).join("");
+        updateSelectedCount();
+      } catch (e) {
+        listEl.innerHTML = `<div class="py-6 text-center text-rose-400">Failed to load catalog: ${e.message}</div>`;
+      }
+    }
+
+    function toggleVaultSelect(itemId, checked) {
+      if (checked) selectedVaultIds.add(itemId);
+      else selectedVaultIds.delete(itemId);
+      updateSelectedCount();
+    }
+
+    function toggleSelectAllVault() {
+      if (selectedVaultIds.size === vaultCatalog.length) {
+        selectedVaultIds.clear();
+      } else {
+        selectedVaultIds = new Set(vaultCatalog.map(i => i.id));
+      }
+      loadVaultCatalog();
+    }
+
+    function updateSelectedCount() {
+      document.getElementById("selected-vault-count").textContent = selectedVaultIds.size;
+      const btn = document.getElementById("batch-mount-btn");
+      if (btn) btn.disabled = (selectedVaultIds.size === 0);
+    }
+
+    async function mountSingleVaultItem(itemId) {
+      const item = vaultCatalog.find(i => i.id === itemId);
+      if (!item) return;
+      closeVaultModal();
+      document.getElementById("stream-url").value = item.url;
+      document.getElementById("stream-title").value = item.title;
+      document.getElementById("mount-form").dispatchEvent(new Event("submit"));
+    }
+
+    async function batchMountSelected() {
+      if (selectedVaultIds.size === 0) return;
+      const itemsToMount = vaultCatalog.filter(i => selectedVaultIds.has(i.id));
+      const btn = document.getElementById("batch-mount-btn");
+      btn.disabled = true;
+      btn.textContent = `Mounting ${itemsToMount.length} streams...`;
+
+      try {
+        const res = await fetch("/api/library/batch-mount", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ items: itemsToMount })
+        });
+        const data = await res.json();
+        if (res.ok && data.status === "success") {
+          alert(`Successfully batch-mounted ${data.mounted_count} streams into active runner!`);
+          closeVaultModal();
+          loadMounts();
+          fetchStatus();
+        } else {
+          alert(`Batch mount error: ${data.message || "Failed"}`);
+        }
+      } catch (e) {
+        alert(`Network error: ${e.message}`);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `🚀 Mount Selected (<span id="selected-vault-count">${selectedVaultIds.size}</span>)`;
+      }
+    }
+
+    async function deleteVaultItem(itemId) {
+      if (!confirm("Remove item from library vault?")) return;
+      await fetch(`/api/library/item/${itemId}`, { method: "DELETE" });
+      selectedVaultIds.delete(itemId);
+      await loadVaultCatalog();
+    }
+
+    async function fetchRemoteVault() {
+      const urlInput = document.getElementById("remote-vault-url");
+      const url = urlInput.value.trim();
+      if (!url) {
+        alert("Please enter a GitHub Gist or raw JSON URL.");
+        return;
+      }
+      const btn = document.getElementById("sync-remote-btn");
+      btn.disabled = true;
+      btn.textContent = "Syncing...";
+      try {
+        const res = await fetch("/api/library/fetch-remote", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ remote_url: url })
+        });
+        const data = await res.json();
+        if (res.ok && data.status === "success") {
+          alert(`Synced ${data.imported_count} items from remote! Total: ${data.total_catalog}`);
+          urlInput.value = "";
+          await loadVaultCatalog();
+        } else {
+          alert(`Sync failed: ${data.message}`);
+        }
+      } catch (e) {
+        alert(`Fetch error: ${e.message}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Sync Links";
+      }
+    }
+
+    async function exportVaultJson() {
+      try {
+        const res = await fetch("/api/library/export");
+        const data = await res.json();
+        const jsonStr = JSON.stringify(data.catalog, null, 2);
+        const blob = new Blob([jsonStr], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `cloudstream_library_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        alert("Failed to export JSON: " + e.message);
+      }
+    }
+
+    function importVaultJson(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const parsed = JSON.parse(e.target.result);
+          const res = await fetch("/api/library/import", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ items: parsed })
+          });
+          const data = await res.json();
+          if (res.ok && data.status === "success") {
+            alert(`Imported ${data.imported_count} streams into vault!`);
+            await loadVaultCatalog();
+          }
+        } catch (err) {
+          alert("Invalid JSON file: " + err.message);
+        }
+      };
+      reader.readAsText(file);
+    }
 
     async function unmountFile(filename) {
       if (!confirm(`Unmount stream?`)) return;
       await fetch(`/api/mounts/${filename}`, { method: "DELETE" });
+      loadMounts();
+      fetchStatus();
+    }
+
+    async function unmountAllStreams() {
+      if (!confirm(`Unmount all active streams from current runner?`)) return;
+      await fetch(`/api/unmount-all`, { method: "POST" });
       loadMounts();
       fetchStatus();
     }

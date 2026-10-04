@@ -17,10 +17,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("cloudstream_main")
 
-from stream_probe import probe_stream, extract_filename
+from stream_probe import probe_stream, extract_filename, get_probe_status
 from webdav_engine import handle_webdav_request, mount_manager
 from range_proxy import telemetry_stats
 from central_hub import hub_router, dav_redirect_router, registry
+from library_vault import vault
 
 app = FastAPI(
     title="CloudStream WebDAV Bridge",
@@ -45,10 +46,28 @@ class MountRequest(BaseModel):
     url: str
     title: Optional[str] = None
     custom_headers: Optional[dict] = None
+    probe_id: Optional[str] = None
 
 
 class UnmountRequest(BaseModel):
     filename: str
+
+
+class RemoteFetchRequest(BaseModel):
+    remote_url: str
+    merge: Optional[bool] = True
+
+
+class SaveItemRequest(BaseModel):
+    url: str
+    title: Optional[str] = None
+    custom_headers: Optional[dict] = None
+    size_hint: Optional[str] = None
+    category: Optional[str] = "Movies"
+
+
+class BatchMountRequest(BaseModel):
+    items: list
 
 
 @app.api_route("/", methods=["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH"])
@@ -79,17 +98,37 @@ async def root_dispatcher(request: Request):
 @app.post("/api/mount")
 async def api_mount_stream(req: MountRequest, request: Request):
     """
-    Probes upstream link in <100ms, detects 4K Remux container/range support,
-    and mounts it as a virtual file on WebDAV.
+    Probes upstream link, tracks multi-stage readiness, activates WebDAV Probe Shield,
+    and mounts stream as a virtual file on WebDAV.
     Guarantees mounting even if upstream probe fails or returns non-200.
     """
     url = req.url.strip()
     if not url:
         return JSONResponse({"status": "error", "message": "URL cannot be empty"}, status_code=400)
 
-    # 1. Pre-flight probe (never block or 422 if valid is False)
+    probe_id = req.probe_id or f"prb_{int(time.time()*1000)}"
+    initial_filename = extract_filename(url) or f"stream_{int(time.time())}.mkv"
+    title = req.title or initial_filename
+    movie_id = f"m_{int(time.time())}"
+
+    # Optimistic initial registration with probing=True & probe_id
+    # This activates the WebDAV Probe Shield: incoming PROPFIND / HEAD / GET requests
+    # from CX File Explorer will be held for up to 4.0s instead of receiving corrupt 0-byte sizes!
+    mount_manager.add_mount(
+        movie_id=movie_id,
+        filename=initial_filename,
+        upstream_url=url,
+        total_bytes=0,
+        content_type="video/x-matroska",
+        formatted_size="Probing...",
+        title=title,
+        probing=True,
+        probe_id=probe_id
+    )
+
+    # 1. Pre-flight probe with multi-stage telemetry
     try:
-        probe_result = await probe_stream(url, custom_headers=req.custom_headers)
+        probe_result = await probe_stream(url, probe_id=probe_id, custom_headers=req.custom_headers)
     except Exception as e:
         logger.warning(f"Unexpected probe exception for {url}: {e}")
         probe_result = {
@@ -100,7 +139,7 @@ async def api_mount_stream(req: MountRequest, request: Request):
             "content_type": "video/x-matroska",
             "total_bytes": 0,
             "formatted_size": "Dynamic Stream",
-            "default_filename": extract_filename(url, ext=".mkv"),
+            "default_filename": initial_filename,
             "final_url": url,
             "elapsed_ms": 0.0,
             "error": str(e)
@@ -115,23 +154,34 @@ async def api_mount_stream(req: MountRequest, request: Request):
             "Mounting stream in dynamic/fallback mode."
         )
 
-    # 2. Register virtual mount
-    filename = probe_result.get("default_filename") or extract_filename(url) or f"stream_{int(time.time())}.mkv"
+    # 2. Update mount with locked size & discovered parameters
+    final_filename = probe_result.get("default_filename") or initial_filename
     total_bytes = probe_result.get("total_bytes", 0)
     content_type = probe_result.get("content_type", "video/x-matroska")
     formatted_size = probe_result.get("formatted_size") or "Dynamic Stream"
     upstream_url = probe_result.get("final_url") or url
-    title = req.title or filename
-    movie_id = f"m_{int(time.time())}"
+
+    if final_filename != initial_filename and initial_filename in mount_manager.mounts:
+        mount_manager.remove_mount(initial_filename)
 
     mount = mount_manager.add_mount(
         movie_id=movie_id,
-        filename=filename,
+        filename=final_filename,
         upstream_url=upstream_url,
         total_bytes=total_bytes,
         content_type=content_type,
         formatted_size=formatted_size,
-        title=title
+        title=title,
+        probing=False,
+        probe_id=probe_id
+    )
+
+    # Auto-save to Library Vault for persistence across virtual environments
+    vault.add_or_update(
+        url=url,
+        title=title,
+        custom_headers=req.custom_headers,
+        size_hint=formatted_size
     )
 
     # Base URL derivation
@@ -141,11 +191,12 @@ async def api_mount_stream(req: MountRequest, request: Request):
         "status": "success",
         "mount": mount,
         "probe": probe_result,
+        "probe_id": probe_id,
         "stream_endpoints": {
             "webdav_folder": f"{base_url}/dav/",
-            "webdav_file": f"{base_url}/dav/{filename}",
-            "direct_stream": f"{base_url}/dav/{filename}",
-            "vlc_intent": f"intent:{base_url}/dav/{filename}#Intent;action=android.intent.action.VIEW;type=video/*;end",
+            "webdav_file": f"{base_url}/dav/{final_filename}",
+            "direct_stream": f"{base_url}/dav/{final_filename}",
+            "vlc_intent": f"intent:{base_url}/dav/{final_filename}#Intent;action=android.intent.action.VIEW;type=video/*;end",
             "cx_file_explorer": {
                 "server": request.url.hostname or "localhost",
                 "port": request.url.port or (443 if request.url.scheme == "https" else 80),
@@ -161,6 +212,117 @@ async def api_mount_stream(req: MountRequest, request: Request):
         response_data["warning"] = f"Stream mounted in fallback mode: {probe_result.get('error')}"
 
     return response_data
+
+
+@app.get("/api/probe/status/{probe_id}")
+async def api_probe_status(probe_id: str):
+    """Returns real-time multi-stage probe progress for UI meter."""
+    status = get_probe_status(probe_id)
+    if not status:
+        return JSONResponse({"status": "error", "message": "Probe ID not found"}, status_code=404)
+    return {"status": "success", "probe": status}
+
+
+# -------------------------------------------------------------
+# Library Vault & Cloud Persistence APIs
+# -------------------------------------------------------------
+@app.get("/api/library/catalog")
+async def api_library_catalog():
+    """Retrieve all catalog items from persistent library vault."""
+    return {"status": "success", "items": vault.list_items()}
+
+
+@app.get("/api/library/export")
+async def api_library_export():
+    """Export complete stream catalog as JSON."""
+    return {"status": "success", "catalog": vault.export_catalog()}
+
+
+@app.post("/api/library/import")
+async def api_library_import(payload: dict):
+    """Import stream catalog JSON from client."""
+    items = payload.get("items") or payload.get("catalog") or []
+    if isinstance(payload, list):
+        items = payload
+    count = vault.import_catalog(items, merge=payload.get("merge", True) if isinstance(payload, dict) else True)
+    return {"status": "success", "imported_count": count, "total_items": len(vault.catalog)}
+
+
+@app.post("/api/library/fetch-remote")
+async def api_library_fetch_remote(req: RemoteFetchRequest):
+    """Fetch and sync stream links from GitHub Gist or raw JSON URL."""
+    try:
+        result = await vault.fetch_from_remote_url(req.remote_url, merge=req.merge)
+        return {"status": "success", **result}
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+
+
+@app.post("/api/library/save-item")
+async def api_library_save_item(req: SaveItemRequest):
+    """Save an individual stream item to persistent catalog."""
+    item = vault.add_or_update(
+        url=req.url,
+        title=req.title,
+        custom_headers=req.custom_headers,
+        size_hint=req.size_hint,
+        category=req.category
+    )
+    return {"status": "success", "item": item}
+
+
+@app.delete("/api/library/item/{item_id}")
+async def api_library_delete_item(item_id: str):
+    """Delete an item from persistent catalog."""
+    removed = vault.remove_item(item_id)
+    if removed:
+        return {"status": "success", "message": f"Deleted item {item_id}"}
+    return JSONResponse({"status": "error", "message": "Item not found"}, status_code=404)
+
+
+@app.post("/api/library/batch-mount")
+async def api_library_batch_mount(req: BatchMountRequest, request: Request):
+    """
+    Mounts multiple selected streams from the Library Vault into the active runner.
+    """
+    mounted = []
+    base_url = str(request.base_url).rstrip("/")
+    for item in req.items:
+        url = item.get("url") if isinstance(item, dict) else str(item)
+        if not url:
+            continue
+        title = item.get("title") if isinstance(item, dict) else None
+        probe_id = f"prb_{int(time.time()*1000)}"
+        filename = extract_filename(url) or f"stream_{int(time.time())}.mkv"
+
+        try:
+            probe_result = await probe_stream(url, probe_id=probe_id)
+            final_filename = probe_result.get("default_filename") or filename
+            total_bytes = probe_result.get("total_bytes", 0)
+            content_type = probe_result.get("content_type", "video/x-matroska")
+            formatted_size = probe_result.get("formatted_size") or "Dynamic Stream"
+            upstream_url = probe_result.get("final_url") or url
+        except Exception:
+            final_filename = filename
+            total_bytes = 0
+            content_type = "video/x-matroska"
+            formatted_size = "Dynamic Stream"
+            upstream_url = url
+
+        mount = mount_manager.add_mount(
+            movie_id=f"m_{int(time.time())}",
+            filename=final_filename,
+            upstream_url=upstream_url,
+            total_bytes=total_bytes,
+            content_type=content_type,
+            formatted_size=formatted_size,
+            title=title or final_filename,
+            probing=False,
+            probe_id=probe_id
+        )
+        mounted.append(mount)
+
+    return {"status": "success", "mounted_count": len(mounted), "mounts": mounted}
 
 
 @app.get("/api/mounts")

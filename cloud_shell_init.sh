@@ -71,4 +71,10 @@ fi
 
 # 3. Launch persistent runner with anti-idle heartbeat and multi-user arguments
 echo -e "${GREEN}[*] Launching Step 2 persistent runner (preparing Step 3 CX File Explorer setup)...${RESET}"
-exec python3 cloud_shell_runner.py --user "${USER_ID}" --hub "${HUB_URL}"
+if command -v tmux &>/dev/null; then
+    tmux new-session -d -s cloudstream "python3 cloud_shell_runner.py --user '${USER_ID}' --hub '${HUB_URL}'" 2>/dev/null || true
+    echo persistent tmux session active.
+    tmux attach -t cloudstream
+else
+    exec python3 cloud_shell_runner.py --user "${USER_ID}" --hub "${HUB_URL}"
+fi

@@ -13,12 +13,14 @@ import os
 import json
 import base64
 import email.utils
+import asyncio
 from urllib.parse import unquote, quote, urlsplit
 from xml.sax.saxutils import escape
 from typing import Dict, Any, Optional
 from starlette.requests import Request
 from starlette.responses import Response, PlainTextResponse, RedirectResponse
 from range_proxy import stream_range_proxy
+from stream_probe import get_probe_event
 
 def xml_escape(val: Any) -> str:
     """Escape special characters (&, <, >, \", ') for safe XML injection."""
@@ -81,7 +83,9 @@ class MountManager:
         total_bytes: int,
         content_type: str,
         formatted_size: str,
-        title: Optional[str] = None
+        title: Optional[str] = None,
+        probing: bool = False,
+        probe_id: Optional[str] = None
     ) -> Dict[str, Any]:
         mount_data = {
             "id": movie_id,
@@ -91,12 +95,23 @@ class MountManager:
             "total_bytes": total_bytes,
             "content_type": content_type,
             "formatted_size": formatted_size,
+            "probing": probing,
+            "probe_id": probe_id,
             "created_at": time.time(),
             "last_accessed": time.time()
         }
         self.mounts[filename] = mount_data
         self.save()
         return mount_data
+
+    def update_mount(self, filename: str, **kwargs) -> Optional[Dict[str, Any]]:
+        mount = self.mounts.get(filename)
+        if mount:
+            mount.update(kwargs)
+            mount["last_accessed"] = time.time()
+            self.save()
+            return mount
+        return None
 
     def get_by_filename(self, filename: str) -> Optional[Dict[str, Any]]:
         return self.mounts.get(filename)
@@ -273,9 +288,45 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
             mount = mount_manager.get_by_filename(filename)
             if not mount:
                 return PlainTextResponse(f"File '{filename}' not found on WebDAV bridge.", status_code=404)
+
+            # WebDAV Probe Shield: Hold client request if stream is actively probing or total_bytes <= 0
+            if mount.get("probing", False) or mount.get("total_bytes", 0) <= 0:
+                probe_id = mount.get("probe_id")
+                if probe_id:
+                    evt = get_probe_event(probe_id)
+                    if not evt.is_set():
+                        try:
+                            await asyncio.wait_for(evt.wait(), timeout=4.0)
+                            refreshed = mount_manager.get_by_filename(filename)
+                            if refreshed:
+                                mount = refreshed
+                        except asyncio.TimeoutError:
+                            return Response(
+                                content='<?xml version="1.0" encoding="utf-8"?>\n<D:error xmlns:D="DAV:"><D:need-privileges/><message>CloudStream Probe Shield: Upstream probe in progress. Please retry in 2 seconds.</message></D:error>',
+                                status_code=503,
+                                headers={
+                                    "Content-Type": 'application/xml; charset="utf-8"',
+                                    "Retry-After": "2",
+                                    "Cache-Control": "no-cache, no-store, must-revalidate"
+                                }
+                            )
+
             xml_resp = build_propfind_xml(base_dav_path, target_file=mount)
         else:
             depth = request.headers.get("Depth", "1")
+            # WebDAV Probe Shield: If any mounted stream is currently probing, wait up to 3.0s for probes to complete
+            probing_mounts = [m for m in mount_manager.list_all() if m.get("probing", False)]
+            if probing_mounts:
+                probe_evts = [get_probe_event(m["probe_id"]) for m in probing_mounts if m.get("probe_id")]
+                if probe_evts:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*(e.wait() for e in probe_evts if not e.is_set()), return_exceptions=True),
+                            timeout=3.0
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
             xml_resp = build_propfind_xml(base_dav_path, depth=depth)
 
         encoded_resp = xml_resp.encode("utf-8")
@@ -326,6 +377,29 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
 
     if not mount:
         return PlainTextResponse(f"File '{filename}' not found on WebDAV bridge.", status_code=404)
+
+    # WebDAV Probe Shield: Asynchronously hold incoming HEAD or GET requests for up to 4 seconds,
+    # or return HTTP 503 Retry-After so CX File Explorer never receives a 0-byte corrupt stream.
+    if mount.get("probing", False) or mount.get("total_bytes", 0) <= 0:
+        probe_id = mount.get("probe_id")
+        if probe_id:
+            evt = get_probe_event(probe_id)
+            if not evt.is_set():
+                try:
+                    await asyncio.wait_for(evt.wait(), timeout=4.0)
+                    refreshed = mount_manager.get_by_filename(filename)
+                    if refreshed:
+                        mount = refreshed
+                except asyncio.TimeoutError:
+                    return Response(
+                        content="CloudStream Probe Shield: Upstream probe in progress. Please retry in 2 seconds.",
+                        status_code=503,
+                        headers={
+                            "Retry-After": "2",
+                            "Content-Type": "text/plain; charset=utf-8",
+                            "Cache-Control": "no-cache, no-store, must-revalidate"
+                        }
+                    )
 
     total_bytes = mount.get("total_bytes", 0)
     content_type = mount.get("content_type", "video/x-matroska")

@@ -331,12 +331,14 @@ def launch_server(port: int = 7860) -> subprocess.Popen:
     env["PYTHONUNBUFFERED"] = "1"
 
     log_file = open(SERVER_LOG, "w", encoding="utf-8")
+    extra_kwargs = {"start_new_session": True} if os.name != "nt" else {}
     server_proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", str(port)],
         cwd=REPO_DIR,
         stdout=log_file,
         stderr=log_file,
-        env=env
+        env=env,
+        **extra_kwargs
     )
     print(f"{CYAN}[*] CloudStream FastAPI server launched on port {port} (PID: {server_proc.pid}){RESET}")
     print(f"{DIM}    Server logs: {SERVER_LOG}{RESET}")
@@ -373,10 +375,12 @@ def launch_tunnel(cloudflared_path: str, port: int = 7860) -> subprocess.Popen:
 
     log_file = open(TUNNEL_LOG, "w", encoding="utf-8")
     tunnel_cmd = [cloudflared_path, "tunnel", "--url", f"http://localhost:{port}"]
+    extra_kwargs = {"start_new_session": True} if os.name != "nt" else {}
     tunnel_proc = subprocess.Popen(
         tunnel_cmd,
         stdout=log_file,
-        stderr=log_file
+        stderr=log_file,
+        **extra_kwargs
     )
     print(f"{CYAN}[*] Cloudflare tunnel launched (PID: {tunnel_proc.pid}){RESET}")
     print(f"{DIM}    Tunnel logs: {TUNNEL_LOG}{RESET}")
@@ -530,10 +534,13 @@ def run_heartbeat_loop(
     hub_url: str = "https://cloud-stream-bridge.onrender.com",
     user_id: str = "default",
     tunnel_url: str = "",
-    port: int = 7860
+    port: int = 7860,
+    cloudflared_bin: str = "",
+    auto_restart: bool = False,
+    max_restarts: int = 10,
 ):
     """
-    12-Hour Anti-Idle Heartbeat Keep-Alive Loop.
+    12-Hour Anti-Idle Heartbeat Keep-Alive Loop with Self-Healing Tunnel Supervisor.
     Google Cloud Shell disconnects after 20 minutes without terminal activity.
     Emits a clean 1-line status pulse every 50 seconds to keep session active,
     and sends a keep-alive pulse to {hub_url}/api/register to refresh central hub 12h TTL.
@@ -541,7 +548,11 @@ def run_heartbeat_loop(
     global tunnel_proc
     start_time = time.time()
     pulse_count = 0
+    restarts_count = 0
     clean_hub = hub_url.rstrip("/") if hub_url else ""
+    if auto_restart and not cloudflared_bin:
+        cloudflared_bin = ensure_cloudflared_binary()
+
     print(f"{GREEN}[*] Step 2 anti-idle heartbeat active. Keep this Cloud Shell tab open while streaming.{RESET}")
     print(f"{DIM}[*] Device: {user_id} (Zero Google Sign-In) | Hub: {clean_hub or 'None'} | Interval: 50s | Ctrl+C to stop.{RESET}\n")
 
@@ -549,8 +560,41 @@ def run_heartbeat_loop(
         try:
             if tunnel_proc is not None and tunnel_proc.poll() is not None:
                 ret = tunnel_proc.poll()
-                print(f"\n{YELLOW}[!] Cloudflared tunnel died: process exited with exit code {ret}. Stopping heartbeat loop.{RESET}")
-                break
+                if not auto_restart or restarts_count >= max_restarts:
+                    print(f"\n{YELLOW}[!] Cloudflared tunnel died: process exited with exit code {ret}. Stopping heartbeat loop.{RESET}")
+                    break
+
+                restarts_count += 1
+                print(f"\n{YELLOW}[!] cloudflared disconnected (exit code {ret}, restart {restarts_count}/{max_restarts}). Auto-restarting tunnel supervisor...{RESET}")
+                try:
+                    if tunnel_proc is not None:
+                        tunnel_proc.terminate()
+                        tunnel_proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        if tunnel_proc is not None:
+                            tunnel_proc.kill()
+                    except Exception:
+                        pass
+
+                if os.name != "nt":
+                    try:
+                        subprocess.run(
+                            ["pkill", "-9", "-f", "cloudflared.*tunnel"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                    except Exception:
+                        pass
+                time.sleep(1)
+
+                launch_tunnel(cloudflared_bin, port=port)
+                new_url = extract_tunnel_url(timeout_secs=45)
+                if is_valid_tunnel_url(new_url):
+                    tunnel_url = new_url
+                    if clean_hub:
+                        register_with_hub(clean_hub, user_id, tunnel_url)
+                continue
 
             pulse_count += 1
             now_str = datetime.now().strftime("%H:%M:%S")
@@ -595,9 +639,8 @@ def run_heartbeat_loop(
                 time.sleep(1)
         except (KeyboardInterrupt, SystemExit):
             break
-        except Exception:
-            if tunnel_proc is not None and tunnel_proc.poll() is not None:
-                break
+        except Exception as e:
+            print(f"{YELLOW}[!] Heartbeat loop error: {e}. Retrying...{RESET}")
             time.sleep(5)
 
 
@@ -612,6 +655,8 @@ def main():
     signal.signal(signal.SIGINT, cleanup_and_exit)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, cleanup_and_exit)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     print(f"\n{BOLD}{CYAN}=== Step 2: Google Cloud Shell Launcher (CloudStream Bridge) ==={RESET}")
     print(f"{CYAN}[*] Unique Device Username: {BOLD}{user_id}{RESET} (Zero Google Sign-In)")
@@ -657,7 +702,7 @@ def main():
     print_banner(tunnel_url, mount_count, user_id=user_id, hub_url=hub_url)
 
     # 9. Enter anti-idle heartbeat loop
-    run_heartbeat_loop(hub_url=hub_url, user_id=user_id, tunnel_url=tunnel_url, port=port)
+    run_heartbeat_loop(hub_url=hub_url, user_id=user_id, tunnel_url=tunnel_url, port=port, cloudflared_bin=cloudflared_bin, auto_restart=True)
 
     cleanup_and_exit()
 

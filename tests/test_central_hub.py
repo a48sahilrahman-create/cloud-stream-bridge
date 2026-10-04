@@ -77,7 +77,7 @@ def test_register_user_success():
 
 
 def test_register_user_update_existing():
-    """Updating an existing user updates tunnel and refreshes last_seen while keeping registered_at."""
+    """Updating an existing user updates tunnel, refreshes registered_at and last_seen."""
     client.post("/api/register", json={
         "user_id": "usr_repeat",
         "tunnel_url": "https://old-tunnel.trycloudflare.com",
@@ -98,9 +98,10 @@ def test_register_user_update_existing():
     assert data2["tunnel_url"] == "https://new-tunnel.trycloudflare.com"
 
     entry2 = registry.get("usr_repeat")
-    assert entry2["registered_at"] == orig_registered_at
+    assert entry2["registered_at"] >= orig_registered_at
     assert entry2["tunnel_url"] == "https://new-tunnel.trycloudflare.com"
     assert entry2["last_seen"] >= entry1["last_seen"]
+    assert entry2["heartbeat_timeout_sec"] == 120
 
 
 def test_register_user_validation_error():
@@ -117,21 +118,47 @@ def test_register_user_validation_error():
 # ============================================================================
 
 def test_status_active_user():
-    """Active user status reports active=True and valid remaining TTL."""
+    """Active user status reports active=True and valid remaining TTL when active probe succeeds."""
     client.post("/api/register", json={
         "user_id": "usr_active_99",
         "tunnel_url": "https://active-tunnel.trycloudflare.com",
         "ttl_sec": 3600,
     })
 
-    res = client.get("/api/status/usr_active_99")
-    assert res.status_code == 200
-    data = res.json()
-    assert data["active"] is True
-    assert data["user_id"] == "usr_active_99"
-    assert data["tunnel_url"] == "https://active-tunnel.trycloudflare.com"
-    assert data["ttl_remaining_sec"] > 3500
-    assert isinstance(data["last_seen"], float)
+    mock_resp = httpx.Response(
+        status_code=200,
+        content=b'{"status": "online", "streamed_gb": 1.2, "active_streams": 1}',
+        headers={"content-type": "application/json"},
+    )
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_resp
+        res = client.get("/api/status/usr_active_99")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["active"] is True
+        assert data["user_id"] == "usr_active_99"
+        assert data["tunnel_url"] == "https://active-tunnel.trycloudflare.com"
+        assert data["ttl_remaining_sec"] > 3500
+        assert isinstance(data["last_seen"], float)
+        assert data.get("streamed_gb") == 1.2
+
+
+def test_status_unreachable_tunnel_probe_fails():
+    """When active probe fails (530, 502, connection error), get_user_status marks user inactive."""
+    client.post("/api/register", json={
+        "user_id": "usr_probe_fail",
+        "tunnel_url": "https://dead-tunnel.trycloudflare.com",
+        "ttl_sec": 3600,
+    })
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_get.side_effect = httpx.ConnectError("Connection refused")
+        res = client.get("/api/status/usr_probe_fail")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["active"] is False
+        assert data["reason"] == "tunnel_unreachable"
+        assert registry.is_active("usr_probe_fail") is False
 
 
 def test_status_unknown_user():
@@ -648,7 +675,7 @@ def test_dav_get_direct_cdn_302_resolution():
 
 
 def test_dav_offline_tunnel_error_handling_503():
-    """When tunnel is offline or connection fails, hub returns HTTP 503 with informative body."""
+    """When tunnel is offline or connection fails, hub returns HTTP 503 and marks user inactive."""
     client.post("/api/register", json={
         "user_id": "usr_offline_hub",
         "tunnel_url": "https://dead-tunnel.trycloudflare.com",
@@ -663,8 +690,14 @@ def test_dav_offline_tunnel_error_handling_503():
         assert "application/xml" in res_dav.headers.get("content-type", "")
         assert "<status>offline</status>" in res_dav.text
         assert "Cloud Shell tunnel is offline" in res_dav.text
+        # Verify the dead tunnel stops reporting active
+        assert registry.is_active("usr_offline_hub") is False
 
-        # 2. API / JSON client request
+        # 2. API / JSON client request (re-register to test JSON offline error response)
+        client.post("/api/register", json={
+            "user_id": "usr_offline_hub",
+            "tunnel_url": "https://dead-tunnel.trycloudflare.com",
+        })
         res_json = client.request(
             "PROPFIND",
             "/dav/usr_offline_hub/",
@@ -677,7 +710,11 @@ def test_dav_offline_tunnel_error_handling_503():
         assert data["user_id"] == "usr_offline_hub"
         assert "dead-tunnel.trycloudflare.com" in data["tunnel_url"]
 
-        # 3. Plain text client request
+        # 3. Plain text client request (re-register to test text offline error response)
+        client.post("/api/register", json={
+            "user_id": "usr_offline_hub",
+            "tunnel_url": "https://dead-tunnel.trycloudflare.com",
+        })
         res_text = client.request(
             "PROPFIND",
             "/dav/usr_offline_hub/",

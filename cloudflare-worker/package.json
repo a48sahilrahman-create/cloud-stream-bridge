@@ -1,0 +1,15 @@
+{
+  "name": "cloudstream-dav-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test_worker.js"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241004.0",
+    "typescript": "^5.6.2",
+    "wrangler": "^3.80.0"
+  }
+}

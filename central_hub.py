@@ -43,7 +43,10 @@ class InMemoryUserRegistry:
     """
     Thread-safe in-memory registry mapping user_id to active tunnel endpoints.
     Tracks registration timestamp, last seen heartbeat, and TTL (default 12 hours).
+    Enforces a 120s heartbeat timeout (runner pulses every 50s).
     """
+
+    HEARTBEAT_TIMEOUT_SEC = 120
 
     def __init__(self, default_ttl_sec: int = 43200):
         self._lock = threading.RLock()
@@ -62,16 +65,16 @@ class InMemoryUserRegistry:
             now = time.time()
             ttl = ttl_sec if ttl_sec is not None and ttl_sec > 0 else self.default_ttl_sec
             existing = self._users.get(user_id)
-            registered_at = existing["registered_at"] if existing else now
 
             clean_tunnel = tunnel_url.strip().rstrip("/")
             entry = {
                 "user_id": user_id,
                 "tunnel_url": clean_tunnel,
                 "token": token if token is not None else (existing.get("token") if existing else None),
-                "registered_at": registered_at,
+                "registered_at": now,
                 "last_seen": now,
                 "ttl_sec": ttl,
+                "heartbeat_timeout_sec": self.HEARTBEAT_TIMEOUT_SEC,
             }
             self._users[user_id] = entry
             logger.info("User registered/updated: user_id=%s, tunnel=%s, ttl=%ss", user_id, clean_tunnel, ttl)
@@ -84,20 +87,34 @@ class InMemoryUserRegistry:
             return dict(entry) if entry else None
 
     def is_active(self, user_id: str) -> bool:
-        """Check if user registration exists and is within TTL."""
+        """Check both session TTL and heartbeat timeout for an active user."""
         with self._lock:
             entry = self._users.get(user_id)
             if not entry:
                 return False
             now = time.time()
-            return (now - entry["last_seen"]) < entry["ttl_sec"]
+            return (now - entry["last_seen"]) < entry.get("heartbeat_timeout_sec", self.HEARTBEAT_TIMEOUT_SEC) and (now - entry["registered_at"]) < entry["ttl_sec"]
 
-    def touch(self, user_id: str) -> bool:
-        """Refresh last_seen heartbeat for an active user."""
+    def mark_inactive(self, user_id: str) -> bool:
+        """Set entry['last_seen'] = 0 so it immediately shows as inactive/dormant."""
         with self._lock:
             entry = self._users.get(user_id)
-            if entry and (time.time() - entry["last_seen"]) < entry["ttl_sec"]:
-                entry["last_seen"] = time.time()
+            if entry:
+                entry["last_seen"] = 0
+                logger.info("Marked user %s as inactive (last_seen=0)", user_id)
+                return True
+            return False
+
+    def touch(self, user_id: str) -> bool:
+        """Refresh last_seen heartbeat for an active user session."""
+        with self._lock:
+            entry = self._users.get(user_id)
+            if not entry:
+                return False
+            now = time.time()
+            registered_at = entry.get("registered_at", entry["last_seen"])
+            if (now - registered_at) < entry["ttl_sec"]:
+                entry["last_seen"] = now
                 return True
             return False
 
@@ -115,8 +132,9 @@ class InMemoryUserRegistry:
                     "ttl_remaining_sec": 0,
                 }
 
-            active = (now - entry["last_seen"]) < entry["ttl_sec"]
-            ttl_remaining = max(0, int(entry["last_seen"] + entry["ttl_sec"] - now)) if active else 0
+            active = self.is_active(user_id)
+            registered_at = entry.get("registered_at", entry["last_seen"])
+            ttl_remaining = max(0, int(registered_at + entry["ttl_sec"] - now)) if active else 0
 
             return {
                 "active": active,
@@ -129,8 +147,7 @@ class InMemoryUserRegistry:
     def get_active_count(self) -> int:
         """Return count of users with valid, unexpired sessions."""
         with self._lock:
-            now = time.time()
-            return sum(1 for e in self._users.values() if (now - e["last_seen"]) < e["ttl_sec"])
+            return sum(1 for uid in self._users if self.is_active(uid))
 
     def get_total_count(self) -> int:
         """Return total number of registered records."""
@@ -143,15 +160,16 @@ class InMemoryUserRegistry:
             now = time.time()
             res = {}
             for uid, entry in self._users.items():
-                active = (now - entry["last_seen"]) < entry["ttl_sec"]
-                ttl_remaining = max(0, int(entry["last_seen"] + entry["ttl_sec"] - now)) if active else 0
+                active = self.is_active(uid)
+                registered_at = entry.get("registered_at", entry["last_seen"])
+                ttl_remaining = max(0, int(registered_at + entry["ttl_sec"] - now)) if active else 0
                 res[uid] = {
                     "user_id": uid,
                     "active": active,
                     "tunnel_url": entry["tunnel_url"] if active else None,
                     "last_seen": entry["last_seen"],
                     "ttl_remaining_sec": ttl_remaining,
-                    "registered_at": entry.get("registered_at", entry["last_seen"]),
+                    "registered_at": registered_at,
                 }
             return res
 
@@ -258,9 +276,100 @@ async def api_heartbeat(user_id: str):
 async def get_user_status(user_id: str):
     """
     Get active status and remaining TTL for a user.
-    If dormant or not found, active is False.
+    If candidate active is True, performs a fast probe to verify the tunnel is alive.
+    If probe fails (HTTP 530, 502, connection refused, timeout), marks user inactive and returns active=False.
+    If probe returns 200, returns active=True with real metrics.
     """
-    return registry.get_status(user_id.strip())
+    uid = user_id.strip()
+    status_info = registry.get_status(uid)
+    if not status_info.get("active"):
+        return status_info
+
+    entry = registry.get(uid)
+    tunnel_url = (entry.get("tunnel_url") if entry else None) or status_info.get("tunnel_url")
+    if not tunnel_url:
+        registry.mark_inactive(uid)
+        return {
+            "active": False,
+            "user_id": uid,
+            "tunnel_url": None,
+            "last_seen": 0,
+            "ttl_remaining_sec": 0,
+            "reason": "tunnel_unreachable",
+        }
+
+    clean_tunnel = tunnel_url.rstrip("/")
+    probe_success = False
+    metrics: Dict[str, Any] = {}
+
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = None
+            try:
+                resp = await client.get(f"{clean_tunnel}/health")
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+                resp = None
+
+            if resp is not None and resp.status_code == 200:
+                probe_success = True
+                try:
+                    metrics = resp.json() if "application/json" in resp.headers.get("content-type", "") else {}
+                except Exception:
+                    metrics = {}
+            elif resp is not None and resp.status_code in (502, 503, 504, 530):
+                probe_success = False
+            else:
+                # If /health did not return 200 (e.g. 404), probe /api/status
+                try:
+                    resp_status = await client.get(f"{clean_tunnel}/api/status")
+                    if resp_status.status_code == 200:
+                        probe_success = True
+                        try:
+                            metrics = resp_status.json() if "application/json" in resp_status.headers.get("content-type", "") else {}
+                        except Exception:
+                            metrics = {}
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+                    probe_success = False
+
+            # If probe succeeded, attempt to enrich with /api/status telemetry if not already present
+            if probe_success and "streamed_gb" not in metrics:
+                try:
+                    stat_resp = await client.get(f"{clean_tunnel}/api/status")
+                    if stat_resp.status_code == 200:
+                        stat_json = stat_resp.json()
+                        if isinstance(stat_json, dict):
+                            metrics.update(stat_json)
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.warning("Active probe exception for user %s tunnel %s: %s", uid, clean_tunnel, exc)
+        probe_success = False
+
+    if not probe_success:
+        registry.mark_inactive(uid)
+        return {
+            "active": False,
+            "user_id": uid,
+            "tunnel_url": None,
+            "last_seen": 0,
+            "ttl_remaining_sec": 0,
+            "reason": "tunnel_unreachable",
+        }
+
+    registry.touch(uid)
+    res = {
+        "active": True,
+        "user_id": uid,
+        "tunnel_url": clean_tunnel,
+        "last_seen": time.time(),
+        "ttl_remaining_sec": status_info.get("ttl_remaining_sec", 0),
+        "metrics": metrics,
+    }
+    if isinstance(metrics, dict):
+        for k, v in metrics.items():
+            if k not in res:
+                res[k] = v
+    return res
 
 
 @hub_router.get("/api/hub/users")
@@ -628,7 +737,6 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
         )
 
     entry = registry.get(uid)
-    registry.touch(uid)
 
     clean_path = path.lstrip("/")
     encoded_path = quote(clean_path, safe="/:@?=&") if clean_path else ""
@@ -656,16 +764,21 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
                 )
 
                 # Check if tunnel returned a gateway failure or dead Cloudflare tunnel HTML page
-                if resp.status_code in (502, 503, 504) and (
-                    b"<html" in resp.content.lower() or "text/html" in resp.headers.get("content-type", "")
+                if (resp.status_code in (502, 503, 504, 530)) or (
+                    resp.status_code >= 500 and (b"<html" in resp.content.lower() or "text/html" in resp.headers.get("content-type", ""))
                 ):
-                    logger.warning("Upstream tunnel %s returned HTTP %s HTML (offline)", target_url, resp.status_code)
+                    logger.warning("Upstream tunnel %s returned HTTP %s (offline)", target_url, resp.status_code)
+                    registry.mark_inactive(uid)
                     return make_offline_error_response(
                         uid,
                         Exception(f"Upstream Cloud Shell tunnel is offline (HTTP {resp.status_code})"),
                         request,
                         tunnel_url=tunnel_url,
                     )
+
+                # Successful upstream response: only touch if status_code < 500
+                if resp.status_code < 500:
+                    registry.touch(uid)
 
                 media_type = resp.headers.get("content-type", "application/xml; charset=utf-8")
                 content = resp.content
@@ -700,6 +813,7 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
                 )
         except Exception as exc:
             logger.error("WebDAV proxy %s to %s failed: %s", request.method, target_url, exc)
+            registry.mark_inactive(uid)
             return make_offline_error_response(uid, exc, request, tunnel_url=tunnel_url)
 
     # Media streaming (GET, HEAD): HTTP 302 Found redirect preserving zero video proxying
@@ -737,6 +851,20 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
                     headers=fwd_headers,
                     follow_redirects=False,
                 )
+                if (tunnel_probe.status_code in (502, 503, 504, 530)) or (
+                    tunnel_probe.status_code >= 500 and (b"<html" in tunnel_probe.content.lower() or "text/html" in tunnel_probe.headers.get("content-type", ""))
+                ):
+                    registry.mark_inactive(uid)
+                    return make_offline_error_response(
+                        uid,
+                        Exception(f"Upstream Cloud Shell tunnel is offline (HTTP {tunnel_probe.status_code})"),
+                        request,
+                        tunnel_url=tunnel_url,
+                    )
+
+                if tunnel_probe.status_code < 500:
+                    registry.touch(uid)
+
                 if tunnel_probe.status_code in (301, 302, 307, 308) and "location" in tunnel_probe.headers:
                     cdn_url = tunnel_probe.headers["location"]
                     logger.info("Direct CDN 302 resolution: user %s -> %s", uid, cdn_url)
@@ -745,9 +873,11 @@ async def dav_redirect_router(user_id: str, request: Request, path: str = ""):
                     return Response(status_code=302, headers=cdn_headers)
         except Exception as exc:
             logger.error("Failed to query tunnel for CDN 302 (%s): %s", target_url, exc)
+            registry.mark_inactive(uid)
             return make_offline_error_response(uid, exc, request, tunnel_url=tunnel_url)
 
     logger.debug("Redirecting %s %s -> %s", request.method, request.url.path, target_url)
+    registry.touch(uid)
     return Response(
         status_code=302,
         headers=redirect_headers,
