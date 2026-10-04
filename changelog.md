@@ -93,6 +93,8 @@
 - Hugging Face Spaces now requires a paid PRO subscription for custom CPU compute spaces.
 
 ## Important Decisions
+- **Zero-Hallucination Active Liveness Probing**: Decoupled heartbeat timeout (120s) from session TTL (12h). Central Hub actively probes `{tunnel_url}/health` and marks sessions inactive on HTTP 530 / timeout, while the Android app requires a verified pre-flight HTTP 200 from the tunnel before rendering active status, completely eliminating false green badge hallucinations.
+- **Detached `tmux` Session Isolation & SIGHUP Immunity for Cloud Shell**: Prevented premature process group and PTY teardown on browser tab closure by wrapping the Cloud Shell runner in a persistent `tmux` session, setting `start_new_session=True`, masking `SIGHUP`, and adding an auto-restarting tunnel supervisor to achieve true 12-hour session longevity.
 - **Hybrid WebDAV Reverse-Proxy with 302 Video Streaming Bypass**: Standard Android WebDAV clients (CX File Explorer, OkHttp) abort directory enumeration when encountering `HTTP 302 Found` on `PROPFIND` or `OPTIONS`. We reverse-proxy all metadata methods through the Central Hub and Cloudflare Worker (<2 KB XML payloads), while high-bitrate video streaming requests (`GET`, `HEAD`) strictly retain direct `HTTP 302 Found` redirects to Google Cloud Shell's multi-gigabit backbone. Preserves 100% zero video byte proxying and zero hub bandwidth consumption.
 - **Lifecycle Onboarding Inversion (Cloud Shell Before CX)**: Positioned Google Cloud Shell Launcher as Step 2 (before CX File Explorer Setup as Step 3) in the Android UI and documentation, ensuring the backend runner is actively running and registered with Central Hub before the user attempts connection negotiation from CX File Explorer.
 - **Hardware-Anchored Device Unique ID Architecture**: Selected deterministic hardware-anchored device IDs (`model-android_id`, e.g. `rmx3031-4f9a2e81c0d5`) over Google Sign-In / email accounts. Guarantees zero friction, instant bootstrap on Android TV remotes without keyboard typing, and persistent deterministic WebDAV URLs (`/dav/<device_id>/`).
@@ -101,5 +103,6 @@
 - **Local Wi-Fi First for 4K Remux**: Recommended local LAN IP (`192.168.220.41:7860`) for home Android TV playback to achieve maximum unthrottled local bitrate with zero cloud proxy latency.
 
 ## Next Steps
+- Verify live Google Cloud Shell 1-click init (`curl -sSL https://raw.githubusercontent.com/a48sahilrahman-create/cloud-stream-bridge/main/cloud_shell_init.sh | bash -s <user_id>`) from a fresh browser session to observe seamless transition to `🟢 Cloud Shell Active (Verified)`.
 - Add persistent volume metadata caching for presigned URL expiration rollover.
 - Add optional tokenized Basic Authentication for public internet deployments when desired.
