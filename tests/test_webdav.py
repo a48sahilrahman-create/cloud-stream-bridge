@@ -633,6 +633,9 @@ def test_webdav_redirect_preserves_query_params_no_double_escape():
         assert loc_header == presigned_url
         assert "%2520" not in loc_header  # Must NOT double-escape %20 to %2520
         assert "%253B" not in loc_header  # Must NOT double-escape %3B to %253B
+        assert resp_get.headers.get("Cache-Control") == "private, max-age=1800, stale-while-revalidate=300"
+        assert resp_get.headers.get("Vary") == "Range"
+        assert resp_get.headers.get("Keep-Alive") == "timeout=60, max=1000"
 
         # 2. HEAD redirect when ?redirect=1
         resp_head_redir = client.head("/dav/RedirectTest.mkv?redirect=1", follow_redirects=False)
@@ -645,6 +648,48 @@ def test_webdav_redirect_preserves_query_params_no_double_escape():
         assert resp_head_std.headers.get("Content-Length") == "5000"
     finally:
         mount_manager.remove_mount("RedirectTest.mkv")
+
+
+@pytest.mark.asyncio
+async def test_warm_mkv_tail():
+    from stream_probe import warm_mkv_tail, warmed_tails
+    from unittest.mock import patch, MagicMock
+
+    # 1. Total bytes <= 64KB should skip warming
+    assert await warm_mkv_tail("https://example.com/test.mkv", 60000) is False
+
+    # 2. Total bytes > 64KB should warm tail 64KB: (total_bytes - 65536)-(total_bytes - 1)
+    captured_headers = {}
+    mock_resp = MagicMock()
+    mock_resp.status_code = 206
+    async def mock_aiter():
+        yield b"cues_index_data"
+    mock_resp.aiter_bytes = mock_aiter
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        def stream(self, method, url, headers=None):
+            captured_headers.update(headers or {})
+            class MockStreamCtx:
+                async def __aenter__(self):
+                    return mock_resp
+                async def __aexit__(self, *args):
+                    pass
+            return MockStreamCtx()
+
+    with patch("httpx.AsyncClient", MockAsyncClient):
+        url = "https://example.com/movie_tail_test.mkv"
+        total = 100000
+        warmed_tails.discard(f"{url}:{total}")
+        res = await warm_mkv_tail(url, total)
+        assert res is True
+        assert captured_headers.get("Range") == f"bytes={100000 - 65536}-{100000 - 1}"
+        assert captured_headers.get("Range") == "bytes=34464-99999"
 
 
 if __name__ == "__main__":

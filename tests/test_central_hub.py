@@ -747,3 +747,16 @@ def test_dav_dormant_and_expired_json_handling_503():
         )
         assert res_expired_json.status_code == 503
         assert res_expired_json.json()["status"] == "expired"
+
+
+# ============================================================================
+# Anti-Idle Endpoints Decoupled / Removed
+# ============================================================================
+
+def test_anti_idle_endpoints_removed():
+    """Verify /gcs-anti-idle.user.js and /api/anti-idle/bookmarklet are removed."""
+    res_script = client.get("/gcs-anti-idle.user.js")
+    assert res_script.status_code == 404
+
+    res_bm = client.get("/api/anti-idle/bookmarklet")
+    assert res_bm.status_code == 404

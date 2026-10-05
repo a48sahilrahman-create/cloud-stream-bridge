@@ -524,3 +524,99 @@ def test_run_heartbeat_loop_detects_exit_during_interval(monkeypatch):
         assert mock_reg.call_count == 1
 
 
+# ==============================================================================
+# 7. Cloudflare Named Tunnel & Health Probing Tests
+# ==============================================================================
+
+def test_parse_args_named_tunnel_flags():
+    """Verify CLI parsing for --tunnel-token and --tunnel-hostname."""
+    argv = [
+        "--user", "usr_named_1",
+        "--tunnel-token", "eyJhIjoiZGF2LXRva2VuIn0=",
+        "--tunnel-hostname", "dav.mydomain.com"
+    ]
+    args = csr.parse_args(argv)
+    assert args.user == "usr_named_1"
+    assert args.tunnel_token == "eyJhIjoiZGF2LXRva2VuIn0="
+    assert args.tunnel_hostname == "dav.mydomain.com"
+
+
+def test_parse_args_named_tunnel_env_fallbacks(monkeypatch):
+    """Verify env variable fallbacks for TUNNEL_TOKEN and TUNNEL_HOSTNAME."""
+    monkeypatch.setenv("TUNNEL_TOKEN", "env_tok_123")
+    monkeypatch.setenv("TUNNEL_HOSTNAME", "dav.env.org")
+    args = csr.parse_args([])
+    assert args.tunnel_token == "env_tok_123"
+    assert args.tunnel_hostname == "dav.env.org"
+
+
+def test_is_valid_tunnel_url_custom_hostname():
+    """Verify is_valid_tunnel_url accepts custom hostnames when specified."""
+    assert csr.is_valid_tunnel_url("https://dav.mydomain.com", custom_hostname="dav.mydomain.com") is True
+    assert csr.is_valid_tunnel_url("https://dav.mydomain.com/dav/", custom_hostname="dav.mydomain.com") is True
+    assert csr.is_valid_tunnel_url("https://unrelated.com", custom_hostname="dav.mydomain.com") is False
+    # Localhost/127.0.0.1 must be rejected even if custom_hostname is set to it
+    assert csr.is_valid_tunnel_url("http://localhost:7860", custom_hostname="localhost") is False
+    assert csr.is_valid_tunnel_url("http://127.0.0.1:7860", custom_hostname="127.0.0.1") is False
+
+
+def test_launch_tunnel_named_token(monkeypatch):
+    """Verify launch_tunnel issues named tunnel token command."""
+    mock_popen = MagicMock()
+    mock_popen.pid = 9999
+
+    with patch("subprocess.Popen", return_value=mock_popen) as mock_p:
+        proc = csr.launch_tunnel(
+            cloudflared_path="cloudflared",
+            port=7860,
+            tunnel_token="eyJhIjoiZGF2LXRva2VuIn0="
+        )
+        assert proc.pid == 9999
+        called_cmd = mock_p.call_args[0][0]
+        assert called_cmd == [
+            "cloudflared", "tunnel", "run", "--token", "eyJhIjoiZGF2LXRva2VuIn0="
+        ]
+
+
+def test_probe_tunnel_health_success():
+    """Verify probe_tunnel_health returns True on HTTP 200."""
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        res = csr.probe_tunnel_health("https://active-tunnel.trycloudflare.com")
+        assert res is True
+        called_req = mock_urlopen.call_args[0][0]
+        assert called_req.full_url == "https://active-tunnel.trycloudflare.com/health"
+
+
+def test_probe_tunnel_health_530_error():
+    """Verify probe_tunnel_health returns False on Cloudflare HTTP 530 error."""
+    error = urllib.error.HTTPError(
+        url="https://dead-tunnel.trycloudflare.com/health",
+        code=530,
+        msg="Origin DNS error",
+        hdrs={},
+        fp=io.BytesIO(b"Error 1033: Argo Tunnel error")
+    )
+    with patch("urllib.request.urlopen", side_effect=error):
+        res = csr.probe_tunnel_health("https://dead-tunnel.trycloudflare.com")
+        assert res is False
+
+
+def test_probe_tunnel_health_error_1033_body():
+    """Verify probe_tunnel_health detects Error 1033 in response body on other HTTP error codes."""
+    error = urllib.error.HTTPError(
+        url="https://recycled-tunnel.trycloudflare.com/health",
+        code=500,
+        msg="Internal Error",
+        hdrs={},
+        fp=io.BytesIO(b"<html><body><h1>Error 1033</h1><p>Cloudflare Tunnel error</p></body></html>")
+    )
+    with patch("urllib.request.urlopen", side_effect=error):
+        res = csr.probe_tunnel_health("https://recycled-tunnel.trycloudflare.com")
+        assert res is False
+
+
+

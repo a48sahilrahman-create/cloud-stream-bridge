@@ -1,12 +1,30 @@
 /**
- * CloudStream WebDAV Bridge - Cloudflare Worker Edge Router
+ * CloudStream WebDAV Bridge - Cloudflare Worker Edge Router & Standalone WebDAV Server
  *
- * Edge routing layer bridging CX File Explorer / WebDAV clients to dynamic
- * Google Cloud Shell tunnels with 0 bytes video proxying (HTTP 302 Found).
+ * Implements:
+ * 1. RFC 4918 Standalone WebDAV server (OPTIONS, PROPFIND, GET, HEAD, DELETE)
+ * 2. Edge REST Control API (/api/mount, /api/mounts, /api/unmount-all, /health)
+ * 3. 0-Byte Video Streaming Direct Redirection (HTTP 302 Found)
+ * 4. Two-Tier Stream Probing Shield with 100 GiB Synthetic Floor
+ * 5. Backward-compatible dynamic tunnel reverse-proxy fallback
  */
 
-export interface Env {
+import type {
+  StreamMount,
+  UserMountsRecord,
+  MountManagerEnv,
+} from "./mount_manager.ts";
+import {
+  getMountsRecord,
+  addMount,
+  removeMount,
+  clearMounts,
+  findMount,
+} from "./mount_manager.ts";
+
+export interface Env extends MountManagerEnv {
   RENDER_HUB_URL?: string;
+  MOUNTS_KV?: KVNamespace;
   [key: string]: unknown;
 }
 
@@ -22,7 +40,8 @@ interface CachedTunnel {
 }
 
 const DEFAULT_HUB_URL = "https://cloud-stream-bridge.onrender.com";
-const CACHE_TTL_MS = 10_000; // 10s in-memory cache
+const CACHE_TTL_MS = 10_000; // 10s in-memory cache for Cloud Shell tunnels
+const SYNTHETIC_FLOOR_BYTES = 107_374_182_400; // 100 GiB Synthetic Floor
 
 // In-memory module state cache for active Cloud Shell tunnels
 const tunnelCache = new Map<string, CachedTunnel>();
@@ -35,17 +54,251 @@ function getCorsHeaders(): Record<string, string> {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, MKCOL",
     "Access-Control-Allow-Headers": "*",
-    "Access-Control-Expose-Headers": "*",
+    "Access-Control-Expose-Headers": "Location, Content-Range, Accept-Ranges, Content-Length, DAV",
   };
+}
+
+/**
+ * Escape XML special characters for RFC 4918 responses
+ */
+function escapeXml(unsafe: string): string {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+/**
+ * Format RFC 1123 / WebDAV date string
+ */
+function formatWebDavDate(timestampMs?: number): string {
+  const d = timestampMs && !isNaN(timestampMs) ? new Date(timestampMs) : new Date();
+  return d.toUTCString();
+}
+
+/**
+ * Infer MIME content-type from virtual filename
+ */
+function inferContentType(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith(".mkv")) return "video/x-matroska";
+  if (lower.endsWith(".mp4") || lower.endsWith(".m4v")) return "video/mp4";
+  if (lower.endsWith(".avi")) return "video/x-msvideo";
+  if (lower.endsWith(".webm")) return "video/webm";
+  if (lower.endsWith(".mov")) return "video/quicktime";
+  if (lower.endsWith(".ts")) return "video/mp2t";
+  if (lower.endsWith(".flv")) return "video/x-flv";
+  return "video/mp4";
+}
+
+/**
+ * Tier 2 Edge Fallback Range Probe (0-8191 with 4s timeout) or 100 GiB synthetic floor
+ */
+async function probeStream(
+  streamUrl: string,
+  customHeaders?: Record<string, string>
+): Promise<{ sizeBytes: number; contentType: string; detectedFilename?: string }> {
+  let sizeBytes = 0;
+  let contentType = "";
+  let detectedFilename: string | undefined;
+
+  try {
+    const probeHeaders: Record<string, string> = {
+      Range: "bytes=0-8191",
+      "User-Agent": "CloudStream-Worker-Probe/1.0",
+      Accept: "*/*",
+      ...(customHeaders || {}),
+    };
+
+    const res = await fetch(streamUrl, {
+      method: "GET",
+      headers: probeHeaders,
+      redirect: "follow",
+      signal: AbortSignal.timeout(4000),
+    });
+
+    const cr = res.headers.get("content-range");
+    if (cr) {
+      const match = cr.match(/\/(\d+)$/);
+      if (match) {
+        const val = parseInt(match[1], 10);
+        if (val > 0) sizeBytes = val;
+      }
+    }
+
+    if (!sizeBytes) {
+      const cl = res.headers.get("content-length");
+      if (cl) {
+        const parsedCl = parseInt(cl, 10);
+        if (parsedCl > 8192) sizeBytes = parsedCl;
+      }
+    }
+
+    const ct = res.headers.get("content-type");
+    if (ct && (ct.includes("video") || ct.includes("application/octet-stream"))) {
+      contentType = ct.split(";")[0].trim();
+    }
+
+    const cd = res.headers.get("content-disposition");
+    if (cd) {
+      const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+      if (fnMatch && fnMatch[1]) {
+        detectedFilename = decodeURIComponent(fnMatch[1].trim());
+      }
+    }
+  } catch (_probeErr) {
+    // Probe timeout or network error: will fall back to synthetic floor
+  }
+
+  if (sizeBytes > 0) {
+    warmStreamStorage(streamUrl, sizeBytes);
+  }
+
+  return {
+    sizeBytes: sizeBytes > 0 ? sizeBytes : SYNTHETIC_FLOOR_BYTES,
+    contentType: contentType || "video/mp4",
+    detectedFilename,
+  };
+}
+
+/**
+ * Asynchronous storage pre-warming helper.
+ * Non-blockingly fetches the head 32KB (MKV EBML header) and tail 64KB (Cues seek table)
+ * into origin NVMe/RAM cache so first-frame rendering and seeking are instant.
+ */
+export function warmStreamStorage(
+  upstreamUrl: string,
+  sizeBytes: number,
+  ctx?: ExecutionContext
+): void {
+  if (!upstreamUrl || typeof upstreamUrl !== "string" || !sizeBytes || sizeBytes <= 0) {
+    return;
+  }
+
+  try {
+    const headPromise = fetch(upstreamUrl, {
+      headers: {
+        Range: "bytes=0-32767",
+        "User-Agent": "CloudStream-Edge-Warmer/1.0",
+      },
+    }).catch(() => {});
+
+    let tailPromise: Promise<unknown> | undefined;
+    if (sizeBytes > 65536) {
+      tailPromise = fetch(upstreamUrl, {
+        headers: {
+          Range: `bytes=${sizeBytes - 65536}-${sizeBytes - 1}`,
+          "User-Agent": "CloudStream-Edge-Warmer/1.0",
+        },
+      }).catch(() => {});
+    }
+
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(headPromise);
+      if (tailPromise) {
+        ctx.waitUntil(tailPromise);
+      }
+    }
+  } catch (_err) {
+    // Non-blocking fire-and-forget
+  }
+}
+
+/**
+ * Render RFC 4918 XML element for a single mounted virtual file
+ */
+function renderMountFileXml(userId: string, mount: StreamMount): string {
+  const encodedFilename = mount.filename
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+
+  return `  <D:response>
+    <D:href>/dav/${encodeURIComponent(userId)}/${encodedFilename}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:displayname>${escapeXml(mount.filename)}</D:displayname>
+        <D:resourcetype/>
+        <D:getcontentlength>${mount.size_bytes}</D:getcontentlength>
+        <D:getcontenttype>${escapeXml(mount.content_type || "video/mp4")}</D:getcontenttype>
+        <D:getetag>${escapeXml(mount.etag)}</D:getetag>
+        <D:getlastmodified>${formatWebDavDate(mount.created_at)}</D:getlastmodified>
+        <D:supportedlock>
+          <D:lockentry>
+            <D:lockscope><D:exclusive/></D:lockscope>
+            <D:locktype><D:write/></D:locktype>
+          </D:lockentry>
+        </D:supportedlock>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>\n`;
+}
+
+/**
+ * Render RFC 4918 207 Multi-Status XML payload for PROPFIND
+ */
+function buildWebDavMultiStatus(
+  userId: string,
+  record: UserMountsRecord,
+  depth: string,
+  targetFilename?: string
+): string {
+  let xml = `<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">\n`;
+
+  // Depth: 0 on a specific child file
+  if (targetFilename) {
+    const cleanTarget = targetFilename.toLowerCase();
+    const mount = record.mounts.find(
+      (m) =>
+        m.filename.toLowerCase() === cleanTarget ||
+        encodeURIComponent(m.filename).toLowerCase() === cleanTarget ||
+        m.id === targetFilename
+    );
+    if (mount) {
+      xml += renderMountFileXml(userId, mount);
+    }
+    xml += `</D:multistatus>`;
+    return xml;
+  }
+
+  // Root collection response
+  xml += `  <D:response>
+    <D:href>/dav/${encodeURIComponent(userId)}/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:displayname>${escapeXml(userId)}</D:displayname>
+        <D:resourcetype><D:collection/></D:resourcetype>
+        <D:getlastmodified>${formatWebDavDate(record.updated_at)}</D:getlastmodified>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>\n`;
+
+  // Depth: 1 (or default) includes all mounted children
+  if (depth !== "0") {
+    for (const mount of record.mounts) {
+      xml += renderMountFileXml(userId, mount);
+    }
+  }
+
+  xml += `</D:multistatus>`;
+  return xml;
 }
 
 /**
  * Query Render Hub status endpoint for user_id with 10s module state cache.
  */
-async function getActiveTunnel(hubUrl: string, userId: string): Promise<string | null> {
+async function getActiveTunnel(
+  hubUrl: string,
+  userId: string,
+  forceRefresh = false
+): Promise<string | null> {
   const now = Date.now();
   const cached = tunnelCache.get(userId);
-  if (cached && now - cached.cachedAt < CACHE_TTL_MS) {
+  if (!forceRefresh && cached && now - cached.cachedAt < CACHE_TTL_MS) {
     return cached.tunnel_url;
   }
 
@@ -85,7 +338,7 @@ async function getActiveTunnel(hubUrl: string, userId: string): Promise<string |
     tunnelCache.delete(userId);
     return null;
   } catch (_err) {
-    if (cached && now - cached.cachedAt < CACHE_TTL_MS) {
+    if (!forceRefresh && cached && now - cached.cachedAt < CACHE_TTL_MS) {
       return cached.tunnel_url;
     }
     return null;
@@ -93,7 +346,7 @@ async function getActiveTunnel(hubUrl: string, userId: string): Promise<string |
 }
 
 /**
- * Generate standard RFC 4918 WebDAV XML error response for dormant/offline tunnels.
+ * Generate standard RFC 4918 WebDAV XML error response for dormant/offline sessions.
  */
 function makeDormantResponse(userId: string, reason = "dormant or offline"): Response {
   const xml = `<?xml version="1.0" encoding="utf-8"?>
@@ -116,15 +369,12 @@ function makeDormantResponse(userId: string, reason = "dormant or offline"): Res
 
 /**
  * Rewrite a single URL from an upstream WebDAV XML href.
- * - Rewrites temporary tunnel URLs to permanent hub paths (/dav/{user_id}/...).
- * - Rewrites relative /dav/... paths to /dav/{user_id}/...
  */
 function rewriteSingleHref(url: string, tunnelUrl: string, userId: string): string {
   const stripped = url.trim();
   const cleanTunnel = tunnelUrl.trim().replace(/\/+$/, "");
   const hubPrefix = `/dav/${userId}`;
 
-  // Candidate tunnel base URLs (support https and http)
   const tunnels = [cleanTunnel];
   if (cleanTunnel.startsWith("https://")) {
     tunnels.push("http://" + cleanTunnel.slice(8));
@@ -145,7 +395,6 @@ function rewriteSingleHref(url: string, tunnelUrl: string, userId: string): stri
     }
   }
 
-  // Upstream relative paths starting with /dav/
   if (stripped.startsWith("/dav/") && !stripped.startsWith(`${hubPrefix}/`)) {
     const remainder = stripped.slice("/dav/".length);
     return `${hubPrefix}/${remainder}`;
@@ -169,6 +418,101 @@ function rewriteWebDavHrefs(xmlContent: string, tunnelUrl: string, userId: strin
   );
 }
 
+/**
+ * Detect dead tunnel error statuses (502, 503, 504, 520-530, or HTML error pages).
+ */
+function isDeadTunnelError(status: number, contentType = "", bodyText = ""): boolean {
+  if (status === 502 || status === 503 || status === 504 || (status >= 520 && status <= 530)) {
+    return true;
+  }
+  if (status >= 500 && (contentType.includes("text/html") || bodyText.toLowerCase().includes("<html"))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Build standard HTTP 302 Found redirect for video/media streaming (0 bytes video proxying).
+ */
+function makeRedirectResponse(tunnelUrl: string, encodedPath: string, search: string): Response {
+  let redirectUrl = encodedPath ? `${tunnelUrl}/dav/${encodedPath}` : `${tunnelUrl}/dav/`;
+  if (search) {
+    redirectUrl += search;
+  }
+  return new Response(null, {
+    status: 302,
+    statusText: "Found",
+    headers: {
+      Location: redirectUrl,
+      DAV: "1",
+      "MS-Author-Via": "DAV",
+      "Accept-Ranges": "bytes",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "Location, Content-Range, Accept-Ranges",
+      "Cache-Control": "private, max-age=1800, stale-while-revalidate=300",
+      "Vary": "Range",
+      "Keep-Alive": "timeout=60, max=1000",
+      ...getCorsHeaders(),
+    },
+  });
+}
+
+/**
+ * Format and rewrite successful upstream response for WebDAV client.
+ */
+async function formatUpstreamResponse(
+  upstreamResp: Response,
+  tunnelUrl: string,
+  userId: string
+): Promise<Response> {
+  const status = upstreamResp.status;
+  const respHeaders = new Headers(upstreamResp.headers);
+  respHeaders.set("DAV", "1");
+  respHeaders.set("MS-Author-Via", "DAV");
+  for (const [k, v] of Object.entries(getCorsHeaders())) {
+    respHeaders.set(k, v);
+  }
+
+  if (respHeaders.has("location")) {
+    const loc = respHeaders.get("location")!;
+    respHeaders.set("Location", rewriteSingleHref(loc, tunnelUrl, userId));
+  }
+
+  // Rewrite <D:href> or <href> for 207 Multi-Status or 200 XML
+  if (status === 207 || status === 200) {
+    const contentType = upstreamResp.headers.get("content-type") || "";
+    const text = await upstreamResp.text();
+    if (
+      contentType.includes("xml") ||
+      text.trim().startsWith("<?xml") ||
+      text.includes("<")
+    ) {
+      const rewritten = rewriteWebDavHrefs(text, tunnelUrl, userId);
+      return new Response(rewritten, {
+        status,
+        statusText: upstreamResp.statusText,
+        headers: respHeaders,
+      });
+    }
+    return new Response(text, {
+      status,
+      statusText: upstreamResp.statusText,
+      headers: respHeaders,
+    });
+  }
+
+  const responseBody =
+    status === 204 || status === 205 || status === 304
+      ? null
+      : await upstreamResp.arrayBuffer();
+
+  return new Response(responseBody, {
+    status,
+    statusText: upstreamResp.statusText,
+    headers: respHeaders,
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -182,7 +526,7 @@ export default {
         status: 204,
         headers: {
           ...getCorsHeaders(),
-          DAV: "1",
+          DAV: "1, 2",
           "MS-Author-Via": "DAV",
         },
       });
@@ -190,9 +534,12 @@ export default {
 
     // 2. Health check and root status
     if (pathname === "/" || pathname === "/health") {
+      const kvBound = Boolean(env?.MOUNTS_KV);
       return new Response(
         JSON.stringify({
           status: "ok",
+          engine: "serverless-edge",
+          kv_bound: kvBound,
           service: "cloudstream-cloudflare-worker",
           render_hub_url: hubUrl,
           cached_tunnels_count: tunnelCache.size,
@@ -208,21 +555,467 @@ export default {
       );
     }
 
-    // 3. WebDAV router: /dav/{user_id} and /dav/{user_id}/{path:.*}
+    // =========================================================================
+    // REST API Handlers
+    // =========================================================================
+
+    // POST /api/mount/:userId
+    const mountMatch = pathname.match(/^\/api\/mount\/([^/]+)\/?$/);
+    if (method === "POST" && mountMatch) {
+      const userId = decodeURIComponent(mountMatch[1]).trim();
+      let body: {
+        url?: string;
+        filename?: string;
+        title?: string;
+        size_bytes?: number;
+        content_type?: string;
+        custom_headers?: Record<string, string>;
+      };
+
+      try {
+        body = (await request.json()) as typeof body;
+      } catch {
+        return new Response(
+          JSON.stringify({ error: "Invalid JSON payload" }),
+          {
+            status: 400,
+            headers: {
+              "Content-Type": "application/json",
+              ...getCorsHeaders(),
+            },
+          }
+        );
+      }
+
+      if (!body || !body.url || typeof body.url !== "string") {
+        return new Response(
+          JSON.stringify({ error: "Missing required parameter: 'url'" }),
+          {
+            status: 400,
+            headers: {
+              "Content-Type": "application/json",
+              ...getCorsHeaders(),
+            },
+          }
+        );
+      }
+
+      const streamUrl = body.url.trim();
+      let filename = body.filename?.trim();
+      let sizeBytes = typeof body.size_bytes === "number" ? body.size_bytes : 0;
+      let contentType = body.content_type?.trim();
+
+      // If size_bytes is missing or 0, trigger Tier 2 probe or synthetic floor
+      if (!sizeBytes || sizeBytes <= 0) {
+        const probed = await probeStream(streamUrl, body.custom_headers);
+        sizeBytes = probed.sizeBytes;
+        if (!contentType && probed.contentType) {
+          contentType = probed.contentType;
+        }
+        if (!filename && probed.detectedFilename) {
+          filename = probed.detectedFilename;
+        }
+      }
+
+      // Fallback filename extraction from URL
+      if (!filename) {
+        try {
+          const parsed = new URL(streamUrl);
+          const segments = parsed.pathname.split("/").filter(Boolean);
+          const last = segments.pop();
+          if (last) {
+            filename = decodeURIComponent(last);
+          }
+        } catch {}
+        if (!filename) {
+          filename = "stream.mkv";
+        }
+      }
+
+      // Sanitize virtual filename
+      filename = filename.replace(/^[/\\]+/, "").trim() || "stream.mkv";
+      if (!filename.includes(".")) {
+        filename += ".mkv";
+      }
+
+      if (!contentType || contentType === "application/octet-stream") {
+        contentType = inferContentType(filename);
+      }
+
+      const mountId = `mount_${Math.random().toString(36).substring(2, 10)}`;
+      const etag = `W/"${mountId.replace("mount_", "")}-${sizeBytes}"`;
+
+      const mount: StreamMount = {
+        id: mountId,
+        filename,
+        title: body.title?.trim() || filename,
+        upstream_url: streamUrl,
+        size_bytes: sizeBytes,
+        content_type: contentType,
+        created_at: Date.now(),
+        etag,
+        custom_headers: body.custom_headers,
+      };
+
+      await addMount(env, userId, mount);
+
+      // Asynchronously pre-warm storage for the newly mounted stream
+      warmStreamStorage(mount.upstream_url, mount.size_bytes, ctx);
+
+      return new Response(
+        JSON.stringify({
+          status: "mounted",
+          mount,
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            ...getCorsHeaders(),
+          },
+        }
+      );
+    }
+
+    // GET /api/mounts/:userId
+    const mountsMatch = pathname.match(/^\/api\/mounts\/([^/]+)\/?$/);
+    if (method === "GET" && mountsMatch) {
+      const userId = decodeURIComponent(mountsMatch[1]).trim();
+      const record = await getMountsRecord(env, userId);
+
+      return new Response(
+        JSON.stringify({
+          user_id: userId,
+          mounts: record ? record.mounts : [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            ...getCorsHeaders(),
+          },
+        }
+      );
+    }
+
+    // DELETE /api/mounts/:userId/:filename
+    const unmountMatch = pathname.match(/^\/api\/mounts\/([^/]+)\/(.+)$/);
+    if (method === "DELETE" && unmountMatch) {
+      const userId = decodeURIComponent(unmountMatch[1]).trim();
+      const filename = decodeURIComponent(unmountMatch[2]);
+      const unmounted = await removeMount(env, userId, filename);
+
+      return new Response(
+        JSON.stringify({
+          status: unmounted ? "unmounted" : "not_found",
+          user_id: userId,
+          filename,
+        }),
+        {
+          status: unmounted ? 200 : 404,
+          headers: {
+            "Content-Type": "application/json",
+            ...getCorsHeaders(),
+          },
+        }
+      );
+    }
+
+    // POST /api/unmount-all/:userId
+    const unmountAllMatch = pathname.match(/^\/api\/unmount-all\/([^/]+)\/?$/);
+    if (method === "POST" && unmountAllMatch) {
+      const userId = decodeURIComponent(unmountAllMatch[1]).trim();
+      const clearedCount = await clearMounts(env, userId);
+
+      return new Response(
+        JSON.stringify({
+          status: "cleared",
+          user_id: userId,
+          mounts_cleared: clearedCount,
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            ...getCorsHeaders(),
+          },
+        }
+      );
+    }
+
+    // =========================================================================
+    // RFC 4918 WebDAV Handlers (/dav/{userId} and /dav/{userId}/{path:.*})
+    // =========================================================================
+
     const davMatch = pathname.match(/^\/dav\/([^/]+)(?:\/(.*))?$/);
     if (davMatch) {
       const userId = decodeURIComponent(davMatch[1]).trim();
       const rawPath = davMatch[2] !== undefined ? davMatch[2] : "";
+      const cleanPath = rawPath.replace(/^\/+/, "");
+      const decodedTargetFilename = cleanPath ? decodeURIComponent(cleanPath) : "";
 
-      // Query Render Hub status with 10s in-memory module cache
+      // 1. OPTIONS /dav/:userId/
+      if (method === "OPTIONS") {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            DAV: "1, 2",
+            "MS-Author-Via": "DAV",
+            Allow: "OPTIONS, GET, HEAD, PROPFIND, DELETE, PROPPATCH, MKCOL",
+            "Accept-Ranges": "bytes",
+            ...getCorsHeaders(),
+          },
+        });
+      }
+
+      // Check standalone KV/memory mounts
+      const userRecord = await getMountsRecord(env, userId);
+
+      // 2. PROPFIND /dav/:userId/ (Standalone WebDAV Directory Listing)
+      if (method === "PROPFIND") {
+        if (userRecord && userRecord.mounts.length > 0) {
+          const depth = request.headers.get("Depth") || "1";
+          if (!cleanPath) {
+            // Root collection listing (Depth: 0 or 1)
+            const xml = buildWebDavMultiStatus(userId, userRecord, depth);
+            return new Response(xml, {
+              status: 207,
+              statusText: "Multi-Status",
+              headers: {
+                "Content-Type": "application/xml; charset=utf-8",
+                DAV: "1, 2",
+                "MS-Author-Via": "DAV",
+                ...getCorsHeaders(),
+              },
+            });
+          } else {
+            // PROPFIND on a specific mounted file
+            const found = userRecord.mounts.find(
+              (m) =>
+                m.filename.toLowerCase() === decodedTargetFilename.toLowerCase() ||
+                encodeURIComponent(m.filename).toLowerCase() === decodedTargetFilename.toLowerCase() ||
+                m.id === decodedTargetFilename
+            );
+            if (found) {
+              const xml = buildWebDavMultiStatus(userId, userRecord, depth, decodedTargetFilename);
+              return new Response(xml, {
+                status: 207,
+                statusText: "Multi-Status",
+                headers: {
+                  "Content-Type": "application/xml; charset=utf-8",
+                  DAV: "1, 2",
+                  "MS-Author-Via": "DAV",
+                  ...getCorsHeaders(),
+                },
+              });
+            }
+          }
+        }
+      }
+
+      // 3a. HEAD /dav/:userId/:filename (Synthetic WebDAV Stream Probe - RFC 4918)
+      // Serves media attributes directly from KV without upstream 302/403 SigV4 failures
+      if (method === "HEAD" && cleanPath) {
+        const mount = await findMount(env, userId, decodedTargetFilename);
+        if (mount) {
+          const totalBytes = mount.size_bytes > 0 ? mount.size_bytes : SYNTHETIC_FLOOR_BYTES;
+          const contentType = mount.content_type || inferContentType(mount.filename);
+          return new Response(null, {
+            status: 200,
+            statusText: "OK",
+            headers: {
+              "Accept-Ranges": "bytes",
+              "Content-Type": contentType,
+              "Content-Length": totalBytes.toString(),
+              "Last-Modified": formatWebDavDate(mount.created_at || Date.now()),
+              ETag: mount.etag || `W/"${mount.id}-${totalBytes}"`,
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Expose-Headers":
+                "Location, Content-Range, Accept-Ranges, Content-Length, Content-Type, DAV",
+              "Cache-Control": "no-cache, no-store, must-revalidate",
+              DAV: "1, 2",
+              "MS-Author-Via": "DAV",
+              ...getCorsHeaders(),
+            },
+          });
+        }
+      }
+
+      // 3b. GET /dav/:userId/:filename (Direct 302 CDN Redirection & Edge Range Proxy)
+      // By default: HTTP 302 Found Direct CDN Redirection (identical to Python webdav_engine.py).
+      // Offloads heavy 4K UHD Remux video streams directly to high-speed CDN/storage with 0-byte edge latency,
+      // avoiding Cloudflare Worker body bandwidth clamping and connection timeouts.
+      // Transparent edge range proxying is available when ?proxy=1 is explicitly requested.
+      if (method === "GET" && cleanPath) {
+        const mount = await findMount(env, userId, decodedTargetFilename);
+        if (mount) {
+          const forceProxy =
+            url.searchParams.get("proxy") === "1" ||
+            url.searchParams.get("proxy") === "true" ||
+            request.headers.get("X-Stream-Mode") === "proxy";
+
+          if (!forceProxy) {
+            // Default: Direct 302 CDN redirection for full wire speed streaming
+            return new Response(null, {
+              status: 302,
+              statusText: "Found",
+              headers: {
+                Location: mount.upstream_url,
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers":
+                  "Location, Content-Range, Accept-Ranges, Content-Length, Content-Type, DAV",
+                "Cache-Control": "private, max-age=1800, stale-while-revalidate=300",
+                "Vary": "Range",
+                "Keep-Alive": "timeout=60, max=1000",
+                DAV: "1, 2",
+                "MS-Author-Via": "DAV",
+                ...getCorsHeaders(),
+              },
+            });
+          }
+
+          // Fallback / Explicit Proxy: Range streaming proxy via Cloudflare Worker
+          const upstreamHeaders = new Headers();
+          upstreamHeaders.set(
+            "User-Agent",
+            request.headers.get("User-Agent") || "CloudStream-Edge-Proxy/1.0"
+          );
+          upstreamHeaders.set("Accept", "*/*");
+          upstreamHeaders.set("Accept-Encoding", "identity");
+
+          const clientRange = request.headers.get("Range");
+          if (clientRange) {
+            upstreamHeaders.set("Range", clientRange);
+          }
+          const clientIfRange = request.headers.get("If-Range");
+          if (clientIfRange) {
+            upstreamHeaders.set("If-Range", clientIfRange);
+          }
+
+          try {
+            const upstreamResp = await fetch(mount.upstream_url, {
+              method: "GET",
+              headers: upstreamHeaders,
+              redirect: "follow",
+            });
+
+            const responseHeaders = new Headers();
+            responseHeaders.set("Accept-Ranges", "bytes");
+            responseHeaders.set("Access-Control-Allow-Origin", "*");
+            responseHeaders.set(
+              "Access-Control-Expose-Headers",
+              "Content-Range, Accept-Ranges, Content-Length, Content-Type, Content-Disposition, DAV"
+            );
+            responseHeaders.set("DAV", "1, 2");
+            responseHeaders.set("MS-Author-Via", "DAV");
+
+            const upstreamContentType = upstreamResp.headers.get("Content-Type");
+            responseHeaders.set(
+              "Content-Type",
+              mount.content_type || upstreamContentType || inferContentType(mount.filename)
+            );
+
+            const upstreamContentRange = upstreamResp.headers.get("Content-Range");
+            if (upstreamContentRange) {
+              responseHeaders.set("Content-Range", upstreamContentRange);
+            } else if (clientRange && mount.size_bytes > 0) {
+              const contentLen = upstreamResp.headers.get("Content-Length");
+              if (contentLen) {
+                responseHeaders.set(
+                  "Content-Range",
+                  `bytes 0-${parseInt(contentLen, 10) - 1}/${mount.size_bytes}`
+                );
+              }
+            }
+
+            const upstreamContentLength = upstreamResp.headers.get("Content-Length");
+            if (upstreamContentLength) {
+              responseHeaders.set("Content-Length", upstreamContentLength);
+            }
+
+            responseHeaders.set(
+              "Content-Disposition",
+              `inline; filename="${encodeURIComponent(mount.filename)}"`
+            );
+
+            const upstreamEtag = upstreamResp.headers.get("ETag");
+            if (upstreamEtag || mount.etag) {
+              responseHeaders.set("ETag", mount.etag || upstreamEtag || "");
+            }
+
+            responseHeaders.set("Cache-Control", "public, max-age=3600");
+
+            return new Response(upstreamResp.body, {
+              status: upstreamResp.status,
+              statusText: upstreamResp.statusText,
+              headers: responseHeaders,
+            });
+          } catch (err: any) {
+            // Upstream proxy failed - fallback to 302 redirect
+            return new Response(null, {
+              status: 302,
+              statusText: "Found",
+              headers: {
+                Location: mount.upstream_url,
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Location, Content-Range, Accept-Ranges",
+                "Cache-Control": "private, max-age=1800, stale-while-revalidate=300",
+                "Vary": "Range",
+                "Keep-Alive": "timeout=60, max=1000",
+                DAV: "1, 2",
+                "MS-Author-Via": "DAV",
+                ...getCorsHeaders(),
+              },
+            });
+          }
+        }
+      }
+
+      // 4. DELETE /dav/:userId/:filename (Standalone Mount Removal)
+      if (method === "DELETE" && cleanPath) {
+        const removed = await removeMount(env, userId, decodedTargetFilename);
+        if (removed) {
+          return new Response(null, {
+            status: 204,
+            statusText: "No Content",
+            headers: {
+              DAV: "1, 2",
+              "MS-Author-Via": "DAV",
+              ...getCorsHeaders(),
+            },
+          });
+        }
+      }
+
+      // =======================================================================
+      // Fallback: Dynamic Cloud Shell Tunnel Reverse-Proxy Layer
+      // =======================================================================
+
       const tunnelUrl = await getActiveTunnel(hubUrl, userId);
 
-      // If dormant or offline, return HTTP 503 with standard RFC 4918 WebDAV XML
+      // If tunnel is dormant or offline:
       if (!tunnelUrl) {
+        // If user has a standalone mounts record with 0 items, return empty collection 207
+        if (method === "PROPFIND" && !cleanPath && userRecord) {
+          const depth = request.headers.get("Depth") || "1";
+          const xml = buildWebDavMultiStatus(userId, userRecord, depth);
+          return new Response(xml, {
+            status: 207,
+            statusText: "Multi-Status",
+            headers: {
+              "Content-Type": "application/xml; charset=utf-8",
+              DAV: "1, 2",
+              "MS-Author-Via": "DAV",
+              ...getCorsHeaders(),
+            },
+          });
+        }
+
         return makeDormantResponse(userId);
       }
 
-      const cleanPath = rawPath.replace(/^\/+/, "");
       const encodedPath = cleanPath
         ? cleanPath
             .split("/")
@@ -230,29 +1023,12 @@ export default {
             .join("/")
         : "";
 
-      // 4. GET / HEAD: HTTP 302 Found redirect (0 bytes video proxying)
+      // Tunnel GET / HEAD: HTTP 302 Found redirect (0 bytes video proxying)
       if (method === "GET" || method === "HEAD") {
-        let redirectUrl = encodedPath
-          ? `${tunnelUrl}/dav/${encodedPath}`
-          : `${tunnelUrl}/dav/`;
-
-        if (url.search) {
-          redirectUrl += url.search;
-        }
-
-        return new Response(null, {
-          status: 302,
-          statusText: "Found",
-          headers: {
-            Location: redirectUrl,
-            DAV: "1",
-            "MS-Author-Via": "DAV",
-            ...getCorsHeaders(),
-          },
-        });
+        return makeRedirectResponse(tunnelUrl, encodedPath, url.search);
       }
 
-      // 5. PROPFIND, OPTIONS, PROPPATCH, MKCOL, DELETE: Reverse-proxy metadata
+      // Tunnel PROPFIND, OPTIONS, PROPPATCH, MKCOL, DELETE: Reverse-proxy metadata
       let targetUrl = encodedPath
         ? `${tunnelUrl}/dav/${encodedPath}`
         : `${tunnelUrl}/dav/`;
@@ -261,12 +1037,57 @@ export default {
         targetUrl += url.search;
       }
 
+      const fwdHeaders = new Headers(request.headers);
+      fwdHeaders.delete("host");
+
+      const reqBody = await request.arrayBuffer();
+
+      const handleFallback = async (): Promise<Response> => {
+        tunnelCache.delete(userId);
+        const newTunnelUrl = await getActiveTunnel(hubUrl, userId, true);
+        if (newTunnelUrl && newTunnelUrl !== tunnelUrl) {
+          if (method === "GET" || method === "HEAD") {
+            return makeRedirectResponse(newTunnelUrl, encodedPath, url.search);
+          }
+
+          try {
+            let retryTargetUrl = encodedPath
+              ? `${newTunnelUrl}/dav/${encodedPath}`
+              : `${newTunnelUrl}/dav/`;
+            if (url.search) {
+              retryTargetUrl += url.search;
+            }
+
+            const retryResp = await fetch(retryTargetUrl, {
+              method,
+              headers: fwdHeaders,
+              body: reqBody && reqBody.byteLength > 0 ? reqBody : undefined,
+            });
+
+            const retryStatus = retryResp.status;
+            if (retryStatus >= 500) {
+              const retryErrText = await retryResp.text();
+              const retryContentType = retryResp.headers.get("content-type") || "";
+              if (isDeadTunnelError(retryStatus, retryContentType, retryErrText)) {
+                tunnelCache.delete(userId);
+                return makeDormantResponse(userId, "unreachable or disconnected");
+              }
+              return new Response(retryErrText, {
+                status: retryStatus,
+                headers: retryResp.headers,
+              });
+            }
+
+            return await formatUpstreamResponse(retryResp, newTunnelUrl, userId);
+          } catch (_retryErr) {
+            tunnelCache.delete(userId);
+            return makeDormantResponse(userId, "unreachable or disconnected");
+          }
+        }
+        return makeDormantResponse(userId, "unreachable or disconnected");
+      };
+
       try {
-        const fwdHeaders = new Headers(request.headers);
-        fwdHeaders.delete("host");
-
-        const reqBody = await request.arrayBuffer();
-
         const upstreamResp = await fetch(targetUrl, {
           method,
           headers: fwdHeaders,
@@ -275,21 +1096,11 @@ export default {
 
         const status = upstreamResp.status;
 
-        // Check if upstream returned a dead tunnel error page (502, 503, 504, 520-530 Cloudflare tunnel errors)
         if (status >= 500) {
           const errText = await upstreamResp.text();
           const contentType = upstreamResp.headers.get("content-type") || "";
-          if (
-            errText.toLowerCase().includes("<html") ||
-            contentType.includes("text/html") ||
-            status === 502 ||
-            status === 503 ||
-            status === 504 ||
-            status === 530 ||
-            (status >= 520 && status <= 530)
-          ) {
-            tunnelCache.delete(userId);
-            return makeDormantResponse(userId, "unreachable or disconnected");
+          if (isDeadTunnelError(status, contentType, errText)) {
+            return await handleFallback();
           }
           return new Response(errText, {
             status,
@@ -297,62 +1108,17 @@ export default {
           });
         }
 
-        const respHeaders = new Headers(upstreamResp.headers);
-        respHeaders.set("DAV", "1");
-        respHeaders.set("MS-Author-Via", "DAV");
-        for (const [k, v] of Object.entries(getCorsHeaders())) {
-          respHeaders.set(k, v);
-        }
-
-        if (respHeaders.has("location")) {
-          const loc = respHeaders.get("location")!;
-          respHeaders.set("Location", rewriteSingleHref(loc, tunnelUrl, userId));
-        }
-
-        // Rewrite <D:href> or <href> for 207 Multi-Status or 200 XML
-        if (status === 207 || status === 200) {
-          const contentType = upstreamResp.headers.get("content-type") || "";
-          const text = await upstreamResp.text();
-          if (
-            contentType.includes("xml") ||
-            text.trim().startsWith("<?xml") ||
-            text.includes("<")
-          ) {
-            const rewritten = rewriteWebDavHrefs(text, tunnelUrl, userId);
-            return new Response(rewritten, {
-              status,
-              statusText: upstreamResp.statusText,
-              headers: respHeaders,
-            });
-          }
-          return new Response(text, {
-            status,
-            statusText: upstreamResp.statusText,
-            headers: respHeaders,
-          });
-        }
-
-        const responseBody =
-          status === 204 || status === 205 || status === 304
-            ? null
-            : await upstreamResp.arrayBuffer();
-
-        return new Response(responseBody, {
-          status,
-          statusText: upstreamResp.statusText,
-          headers: respHeaders,
-        });
+        return await formatUpstreamResponse(upstreamResp, tunnelUrl, userId);
       } catch (_fetchErr) {
-        tunnelCache.delete(userId);
-        return makeDormantResponse(userId, "unreachable or disconnected");
+        return await handleFallback();
       }
     }
 
-    // 6. Unmatched routes -> 404 Not Found
+    // Unmatched routes -> 404 Not Found
     return new Response(
       JSON.stringify({
         error: "Not Found",
-        message: `Endpoint '${pathname}' not found. Supported: /health, /dav/{user_id}`,
+        message: `Endpoint '${pathname}' not found. Supported: /health, /dav/{user_id}/, /api/mount/{user_id}, /api/mounts/{user_id}, /api/unmount-all/{user_id}`,
       }),
       {
         status: 404,

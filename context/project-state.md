@@ -1,6 +1,7 @@
 # Current Project State & Operational Telemetry — CloudStream WebDAV Bridge
 
-> **Executive Status**: Production Ready & Context Optimized. All core RFC 4918 and RFC 7233 WebDAV streaming engines are deployed, verified, and hardened against Android TV / CX File Explorer client quirks.
+> **Executive Status**: Production Ready & Context Optimized. Architectural Status: **Standalone Cloudflare Worker WebDAV Edge Server**.  
+> All core RFC 4918 and RFC 7233 WebDAV streaming engines are deployed, verified, and hardened against Android TV / CX File Explorer client quirks. Google Cloud Shell runner and anti-idle scripts have been permanently quarantined into `archive/cloud_shell/`.
 
 ---
 
@@ -65,21 +66,33 @@
 
 ---
 
+### Milestone 9: Transition to Standalone Cloudflare Worker WebDAV Edge Server & Cloud Shell Archival
+- **Motivation**: Eliminates operational fragility and bandwidth bottlenecks of ephemeral Google Cloud Shell containers (20-min idle timeouts, 50s Render cold-starts, SIGHUP termination, and tunnel speed limits).
+- **Resolution**:
+  - Fully migrated to a permanent serverless Cloudflare Worker Edge Server (`cloudstream-dav-bridge.sahil-cloudstream.workers.dev`) backed by Cloudflare KV (`MOUNTS_KV`) with 15-second in-memory isolate caching and native RFC 4918 WebDAV handlers.
+  - Legacy Google Cloud Shell runner (`cloud_shell_runner.py`), launch script (`cloud_shell_init.sh`), anti-idle hacks (`scripts/gcs_anti_idle_*`), and obsolete runner unit tests have been permanently quarantined into `archive/cloud_shell/`.
+  - Android companion app overhauled with Tier 1 residential IP OkHttp range prober (8 KB container magic byte inspection) and streamlined TV remote D-Pad focus navigation.
+
+---
+
 ## 2. Verification & Test Metrics
 
 | Suite | Status | Score | Coverage |
 | :--- | :---: | :---: | :--- |
-| **Central Hub & Cloud Shell Suite** (`pytest`) | 🟢 PASS | **61 / 61 (100%)** | Central Hub reverse-proxy, WebDAV 302 bypass, Cloud Shell runner, lifecycle integration |
+| **Decoupled Python Core Test Suite** (`pytest`) | 🟢 PASS | **75 / 75 (100%)** | Central Hub reverse-proxy, WebDAV 302 bypass, lifecycle integration, stream probe |
+| **Cloudflare Worker Engine Suite** (`test_worker.js`) | 🟢 PASS | **17 / 17 (100%)** | RFC 4918 XML (PROPFIND/OPTIONS), KV persistence, isolate caching, REST APIs (22 assertion groups) |
+| **Android Companion App Build** (`gradlew`) | 🟢 PASS | **assembleDebug** | `assembleDebug` APK built with 0 errors, Tier 1 OkHttp range prober, 7-node TV D-Pad graph |
 | **Canonical Pytest** (`test_webdav.py`) | 🟢 PASS | **11 / 11 (100%)** | RFC 4918 XML, Range parsing, HEAD, EBML magic bytes, R2 query parsing, single-file PROPFIND |
 | **CX Client Verification** (`verify_cx.py`) | 🟢 PASS | **9 / 9 (100%)** | OPTIONS /, PROPFIND Depth 0/1, GET range, HEAD, Content-Length |
-| **Python Syntax Compilation** | 🟢 PASS | **100% Valid** | `central_hub.py`, `main.py`, `webdav_engine.py`, `range_proxy.py`, `stream_probe.py`, `cloud_shell_runner.py` |
 
 ---
 
-## 3. Active Public Deployment Targets
+## 3. Active Public Deployment Targets & Quarantined Assets
 
-- **Local Port**: `http://localhost:7860`
-- **WebDAV Path**: `http://localhost:7860/dav/`
-- **Cloudflare Tunnel**: Automated via `start_tunnel.ps1` -> `https://*.trycloudflare.com`
-- **Docker Container**: Exposes port 7860 (`python:3.11-slim`)
-- **Hugging Face Spaces**: Deployable via `python hf_zero_touch_deployer.py`
+- **Permanent Edge Worker URL**: `https://cloudstream-dav-bridge.sahil-cloudstream.workers.dev`
+- **Permanent WebDAV Root Path**: `https://cloudstream-dav-bridge.sahil-cloudstream.workers.dev/dav/{userId}/`
+- **Permanent Edge REST API**: `https://cloudstream-dav-bridge.sahil-cloudstream.workers.dev/api/mount/{userId}`
+- **Edge Storage Layer**: Cloudflare KV (`MOUNTS_KV`)
+- **Quarantined Legacy Assets**: `archive/cloud_shell/` (`cloud_shell_runner.py`, `cloud_shell_init.sh`, `scripts/gcs_anti_idle_*`, `tests/test_cloud_shell_runner.py`)
+- **Local Reference Port**: `http://localhost:7860` (FastAPI / `central_hub.py`)
+- **Companion Android App**: `C:\Users\sahil\workspaces\cloud-stream-bridge-android` (Release / Debug APK)

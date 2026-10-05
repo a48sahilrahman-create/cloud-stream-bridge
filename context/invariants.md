@@ -76,3 +76,41 @@ To guarantee native mounting on Android TV, Fire TV, Windows Explorer, macOS Fin
    - The root `/` route MUST support methods `["GET", "HEAD", "OPTIONS", "PROPFIND", "PROPPATCH"]`.
    - If the incoming method is `OPTIONS`, `PROPFIND`, or `PROPPATCH`, it routes directly to `handle_webdav_request(request, path="")`.
    - If the incoming method is `GET` and the `Accept` header indicates a web browser (`text/html`), it serves the Web UI (`templates/index.html`).
+
+---
+
+## 8. 0-Byte Demuxer Immunity Invariant
+- **Problem**: Media demuxers (ExoPlayer, VLC, CX File Explorer internal media player) immediately abort playback if `Content-Length` or `<D:getcontentlength>` is `0` or missing. Streams with delayed headers or non-range CDNs can fail to report size during initial probe.
+- **Two-Tier Shield**:
+  1. **Tier 1 (Residential 8 KB Probe)**: Android app / client probe executes a fast `Range: bytes=0-8191` probe within `<100ms` from residential network to retrieve true `Content-Range: bytes 0-8191/<total_bytes>`.
+  2. **Tier 2 (100 GiB Synthetic Floor)**: If the Tier 1 probe fails or `size_bytes` is unspecified (`0` or missing), the Cloudflare Worker attempts a 4s edge probe. If size still cannot be determined, it injects a mandatory **100 GiB synthetic floor** (`107,374,182,400` bytes).
+- **Invariant**: A mounted resource's `<D:getcontentlength>` MUST NEVER be `0` or negative. It must always be `>= 107,374,182,400` bytes when true size is unknown, guaranteeing media demuxer initialization without buffer underflow or instant EOS (End Of Stream).
+
+---
+
+## 9. Zero-Egress Direct Streaming Invariant
+- **Rule**: NEVER proxy media payload bytes through Cloudflare Workers.
+- **Mechanism**:
+  - All `GET /dav/:userId/:filename` and `HEAD /dav/:userId/:filename` requests MUST immediately respond with `HTTP 302 Found` carrying a `Location: <upstream_cdn_url>` header pointing directly to the origin CDN or active tunnel.
+  - Video stream scrubbing and continuous media transfers take place directly between client device and upstream CDN.
+- **Bandwidth Bound**: Zero (0) media bytes egress through Cloudflare Worker edge isolates, preventing edge CPU timeout limits, bandwidth quota exhaustion, and latency overhead.
+
+---
+
+## 10. Isolate Cache Hit Rate Invariant (>90%)
+- **Problem**: CX File Explorer and WebDAV clients aggressively poll `PROPFIND` (up to 5-10 queries per folder traversal/selection), which would rapidly deplete Cloudflare KV free read limits (100k reads/day).
+- **Mechanism**:
+  - The worker maintains an in-memory V8 isolate cache (`isolateMountsCache: Map<string, CacheEntry>`) with a **15-second TTL** (`ISOLATE_CACHE_TTL_MS = 15_000`).
+  - Read requests (`PROPFIND`, `GET /api/mounts/:userId`) check the isolate memory cache first before dispatching `env.MOUNTS_KV.get()`.
+- **Target Invariant**: Greater than **90%** of WebDAV `PROPFIND` metadata queries are absorbed by the 15s in-memory V8 isolate cache during typical browsing sessions, reducing KV operations to only cold starts and write mutations (`saveUserMount`, `deleteUserMount`, `clearUserMounts`).
+
+---
+
+## 11. Backwards Compatibility for CX File Explorer Invariant (`/dav/:userId/`)
+- **Rule**: CX File Explorer connections configured with `/dav/:userId/` MUST remain 100% operational without requiring user re-configuration or path migration.
+- **Guarantees**:
+  - Host configuration in CX File Explorer points permanently to `cloudstream-dav-bridge.<subdomain>.workers.dev`.
+  - Path prefix `/dav/:userId/` functions identically whether the user has standalone edge mounts in Cloudflare KV or an active dynamic Google Cloud Shell tunnel registered via Central Hub.
+  - If standalone mounts exist in KV, the worker serves them directly from edge cache.
+  - If no standalone mounts exist, the worker seamlessly delegates to the active Cloud Shell tunnel via `getActiveTunnel(hubUrl, userId)`, dynamically rewriting all `<D:href>` and `<href>` tags to `/dav/:userId/...`.
+  - If Cloud Shell is dormant or offline and no standalone mounts exist, the worker returns an RFC 4918-compliant `503 Service Unavailable` with XML error description, preventing CX File Explorer connection crashes.

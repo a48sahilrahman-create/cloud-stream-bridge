@@ -8,5 +8,12 @@
   ],
   "vars": {
     "RENDER_HUB_URL": "https://cloud-stream-bridge.onrender.com"
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "MOUNTS_KV",
+      "id": "71e86c22369f41e0a5672aa9d2317fe3",
+      "preview_id": "883a82680b894d678ed3e1858cc4f4c8"
+    }
+  ]
 }

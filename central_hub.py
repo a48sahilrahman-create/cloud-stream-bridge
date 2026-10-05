@@ -10,9 +10,12 @@ Zero video byte proxying; zero bandwidth consumption on the hub.
 import os
 import re
 import time
+import json
 import logging
+import sqlite3
 import threading
-from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, List
 from urllib.parse import quote
 from xml.sax.saxutils import escape as xml_escape
 
@@ -39,19 +42,380 @@ DORMANT_XML_RESPONSE = (
 )
 
 
+class BasePersistenceBackend:
+    """Abstract base class for durable Central Hub persistence backends."""
+    name: str = "base"
+
+    def save_user(self, entry: Dict[str, Any]) -> bool:
+        raise NotImplementedError
+
+    def update_touch(self, user_id: str, last_seen: float) -> bool:
+        raise NotImplementedError
+
+    def mark_inactive(self, user_id: str) -> bool:
+        raise NotImplementedError
+
+    def delete_user(self, user_id: str) -> bool:
+        raise NotImplementedError
+
+    def load_all_valid(self, now: float) -> Dict[str, Dict[str, Any]]:
+        raise NotImplementedError
+
+    def clear(self) -> None:
+        raise NotImplementedError
+
+
+class InMemoryPersistenceBackend(BasePersistenceBackend):
+    """Fallback in-memory persistence backend."""
+    name: str = "in_memory"
+
+    def __init__(self):
+        self._store: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def save_user(self, entry: Dict[str, Any]) -> bool:
+        with self._lock:
+            self._store[entry["user_id"]] = dict(entry)
+            return True
+
+    def update_touch(self, user_id: str, last_seen: float) -> bool:
+        with self._lock:
+            if user_id in self._store:
+                self._store[user_id]["last_seen"] = last_seen
+                return True
+            return False
+
+    def mark_inactive(self, user_id: str) -> bool:
+        return self.update_touch(user_id, 0.0)
+
+    def delete_user(self, user_id: str) -> bool:
+        with self._lock:
+            return self._store.pop(user_id, None) is not None
+
+    def load_all_valid(self, now: float) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            valid = {}
+            for uid, entry in list(self._store.items()):
+                if (entry["registered_at"] + entry["ttl_sec"]) > now:
+                    valid[uid] = dict(entry)
+                else:
+                    self._store.pop(uid, None)
+            return valid
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+
+class SQLitePersistenceBackend(BasePersistenceBackend):
+    """
+    SQLite persistence backend with Write-Ahead Logging (WAL) mode.
+    Ensures zero data loss, ACID durability, and fast concurrency on persistent disk.
+    """
+    name: str = "sqlite"
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._lock:
+            parent = os.path.dirname(self.db_path)
+            if parent and not os.path.exists(parent):
+                os.makedirs(parent, exist_ok=True)
+            with self._get_connection() as conn:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id TEXT PRIMARY KEY,
+                        tunnel_url TEXT NOT NULL,
+                        token TEXT,
+                        registered_at REAL NOT NULL,
+                        last_seen REAL NOT NULL,
+                        ttl_sec REAL NOT NULL,
+                        heartbeat_timeout_sec REAL NOT NULL
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
+                conn.commit()
+
+    def save_user(self, entry: Dict[str, Any]) -> bool:
+        with self._lock:
+            try:
+                with self._get_connection() as conn:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO users (
+                            user_id, tunnel_url, token, registered_at, last_seen, ttl_sec, heartbeat_timeout_sec
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        entry["user_id"],
+                        entry["tunnel_url"],
+                        entry.get("token"),
+                        float(entry["registered_at"]),
+                        float(entry["last_seen"]),
+                        float(entry["ttl_sec"]),
+                        float(entry.get("heartbeat_timeout_sec", 120)),
+                    ))
+                    conn.commit()
+                return True
+            except Exception as exc:
+                logger.error("SQLite save_user failed: %s", exc)
+                return False
+
+    def update_touch(self, user_id: str, last_seen: float) -> bool:
+        with self._lock:
+            try:
+                with self._get_connection() as conn:
+                    conn.execute("UPDATE users SET last_seen = ? WHERE user_id = ?", (float(last_seen), user_id))
+                    conn.commit()
+                return True
+            except Exception as exc:
+                logger.error("SQLite update_touch failed: %s", exc)
+                return False
+
+    def mark_inactive(self, user_id: str) -> bool:
+        return self.update_touch(user_id, 0.0)
+
+    def delete_user(self, user_id: str) -> bool:
+        with self._lock:
+            try:
+                with self._get_connection() as conn:
+                    conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+                    conn.commit()
+                return True
+            except Exception as exc:
+                logger.error("SQLite delete_user failed: %s", exc)
+                return False
+
+    def load_all_valid(self, now: float) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            try:
+                with self._get_connection() as conn:
+                    conn.execute("DELETE FROM users WHERE (registered_at + ttl_sec) <= ?", (now,))
+                    conn.commit()
+                    cursor = conn.execute("SELECT * FROM users WHERE (registered_at + ttl_sec) > ?", (now,))
+                    rows = cursor.fetchall()
+                    result = {}
+                    for row in rows:
+                        result[row["user_id"]] = {
+                            "user_id": row["user_id"],
+                            "tunnel_url": row["tunnel_url"],
+                            "token": row["token"],
+                            "registered_at": float(row["registered_at"]),
+                            "last_seen": float(row["last_seen"]),
+                            "ttl_sec": float(row["ttl_sec"]),
+                            "heartbeat_timeout_sec": float(row["heartbeat_timeout_sec"]),
+                        }
+                    return result
+            except Exception as exc:
+                logger.error("SQLite load_all_valid failed: %s", exc)
+                return {}
+
+    def clear(self) -> None:
+        with self._lock:
+            try:
+                with self._get_connection() as conn:
+                    conn.execute("DELETE FROM users")
+                    conn.commit()
+            except Exception as exc:
+                logger.error("SQLite clear failed: %s", exc)
+
+
+class UpstashRedisPersistenceBackend(BasePersistenceBackend):
+    """
+    Upstash Serverless Redis REST API persistence backend.
+    Survives Render spin-downs, cold starts, and container reboots with zero external dependencies.
+    Free tier allows 10,000 commands/day.
+    """
+    name: str = "upstash_redis"
+
+    def __init__(self, rest_url: str, rest_token: str):
+        self.rest_url = rest_url.rstrip("/")
+        self.headers = {
+            "Authorization": f"Bearer {rest_token}",
+            "Content-Type": "application/json",
+        }
+        self.prefix = "cloudstream:hub:user:"
+        self.set_key = "cloudstream:hub:active_uids"
+
+    def _execute(self, command: list) -> Any:
+        try:
+            with httpx.Client(timeout=4.0) as client:
+                resp = client.post(self.rest_url, json=command, headers=self.headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("result")
+                else:
+                    logger.warning("Upstash Redis HTTP %s: %s", resp.status_code, resp.text)
+        except Exception as exc:
+            logger.warning("Upstash Redis command %s error: %s", command[0] if command else "UNKNOWN", exc)
+        return None
+
+    def save_user(self, entry: Dict[str, Any]) -> bool:
+        user_id = entry["user_id"]
+        key = f"{self.prefix}{user_id}"
+        now = time.time()
+        ttl_remaining = max(60, int(entry["registered_at"] + entry["ttl_sec"] - now))
+        payload_str = json.dumps(entry)
+
+        res = self._execute(["SET", key, payload_str, "EX", ttl_remaining])
+        self._execute(["SADD", self.set_key, user_id])
+        return res == "OK"
+
+    def update_touch(self, user_id: str, last_seen: float) -> bool:
+        key = f"{self.prefix}{user_id}"
+        raw = self._execute(["GET", key])
+        if not raw:
+            return False
+        try:
+            entry = json.loads(raw)
+            entry["last_seen"] = last_seen
+            now = time.time()
+            ttl_remaining = max(60, int(entry["registered_at"] + entry["ttl_sec"] - now))
+            self._execute(["SET", key, json.dumps(entry), "EX", ttl_remaining])
+            return True
+        except Exception as exc:
+            logger.warning("Upstash update_touch failed: %s", exc)
+            return False
+
+    def mark_inactive(self, user_id: str) -> bool:
+        return self.update_touch(user_id, 0.0)
+
+    def delete_user(self, user_id: str) -> bool:
+        key = f"{self.prefix}{user_id}"
+        self._execute(["DEL", key])
+        self._execute(["SREM", self.set_key, user_id])
+        return True
+
+    def load_all_valid(self, now: float) -> Dict[str, Dict[str, Any]]:
+        uids = self._execute(["SMEMBERS", self.set_key])
+        if not uids or not isinstance(uids, list):
+            return {}
+
+        keys = [f"{self.prefix}{uid}" for uid in uids]
+        if not keys:
+            return {}
+
+        raw_items = self._execute(["MGET"] + keys)
+        if not raw_items or not isinstance(raw_items, list):
+            return {}
+
+        result = {}
+        stale_uids = []
+        for uid, raw_str in zip(uids, raw_items):
+            if not raw_str:
+                stale_uids.append(uid)
+                continue
+            try:
+                entry = json.loads(raw_str)
+                if (entry["registered_at"] + entry["ttl_sec"]) > now:
+                    result[entry["user_id"]] = entry
+                else:
+                    stale_uids.append(uid)
+            except Exception:
+                stale_uids.append(uid)
+
+        if stale_uids:
+            try:
+                self._execute(["SREM", self.set_key] + stale_uids)
+            except Exception:
+                pass
+
+        return result
+
+    def clear(self) -> None:
+        uids = self._execute(["SMEMBERS", self.set_key])
+        if uids and isinstance(uids, list):
+            keys = [f"{self.prefix}{uid}" for uid in uids]
+            if keys:
+                self._execute(["DEL"] + keys)
+        self._execute(["DEL", self.set_key])
+
+
+def create_persistence_backend(
+    backend_type: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> BasePersistenceBackend:
+    """
+    Factory function to initialize durable persistence backend.
+    Priority:
+    1. Upstash Redis REST API (UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN)
+    2. SQLite with WAL mode (HUB_DB_PATH or PERSIST_SQLITE=1 or explicit db_path)
+    3. In-memory fallback
+    """
+    chosen = (backend_type or os.environ.get("HUB_PERSISTENCE_BACKEND", "auto")).lower()
+
+    # 1. Upstash Redis REST API
+    upstash_url = os.environ.get("UPSTASH_REDIS_REST_URL")
+    upstash_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+    if (chosen in ("upstash", "redis", "auto")) and upstash_url and upstash_token:
+        logger.info("Initializing Upstash Redis persistence backend (%s)", upstash_url)
+        return UpstashRedisPersistenceBackend(upstash_url, upstash_token)
+
+    # 2. SQLite with WAL mode
+    configured_db_path = db_path or os.environ.get("HUB_DB_PATH")
+    if (chosen in ("sqlite", "wal") or configured_db_path or os.environ.get("PERSIST_SQLITE") == "1"):
+        sqlite_file = configured_db_path or os.path.join(os.getcwd(), "central_hub.db")
+        logger.info("Initializing SQLite WAL persistence backend at %s", sqlite_file)
+        return SQLitePersistenceBackend(sqlite_file)
+
+    # 3. In-memory fallback
+    logger.info("Initializing In-Memory persistence backend")
+    return InMemoryPersistenceBackend()
+
+
 class InMemoryUserRegistry:
     """
-    Thread-safe in-memory registry mapping user_id to active tunnel endpoints.
-    Tracks registration timestamp, last seen heartbeat, and TTL (default 12 hours).
-    Enforces a 120s heartbeat timeout (runner pulses every 50s).
+    Thread-safe registry mapping user_id to active tunnel endpoints.
+    Combines sub-millisecond in-memory cache with pluggable durable persistence (Upstash / SQLite WAL).
+    Enforces a 120s heartbeat timeout (runner pulses every 50s) and default 12h TTL.
     """
 
     HEARTBEAT_TIMEOUT_SEC = 120
+    TOUCH_DEBOUNCE_SEC = 60.0  # Limit durable touch writes to at most once per 60s per user
 
-    def __init__(self, default_ttl_sec: int = 43200):
+    def __init__(
+        self,
+        default_ttl_sec: int = 43200,
+        backend: Optional[BasePersistenceBackend] = None,
+        db_path: Optional[str] = None,
+        auto_restore: bool = True,
+    ):
         self._lock = threading.RLock()
         self._users: Dict[str, Dict[str, Any]] = {}
         self.default_ttl_sec = default_ttl_sec
+        self.backend = backend or create_persistence_backend(db_path=db_path)
+        self._last_persisted_touch: Dict[str, float] = {}
+        if auto_restore:
+            self.restore_state()
+
+    def restore_state(self) -> int:
+        """
+        Restore non-expired user registrations from durable storage on cold boots / restarts.
+        Returns count of restored records.
+        """
+        with self._lock:
+            now = time.time()
+            try:
+                persisted = self.backend.load_all_valid(now)
+                restored_count = 0
+                for uid, entry in persisted.items():
+                    if uid not in self._users or self._users[uid].get("last_seen", 0) < entry.get("last_seen", 0):
+                        self._users[uid] = dict(entry)
+                        restored_count += 1
+                if restored_count > 0:
+                    logger.info("Restored %d active user registrations from %s backend", restored_count, self.backend.name)
+                return restored_count
+            except Exception as exc:
+                logger.error("Failed to restore state from %s: %s", self.backend.name, exc)
+                return 0
 
     def register(
         self,
@@ -60,7 +424,7 @@ class InMemoryUserRegistry:
         token: Optional[str] = None,
         ttl_sec: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Register or update an active Cloud Shell tunnel for a user."""
+        """Register or update an active Cloud Shell tunnel for a user with durable write-through."""
         with self._lock:
             now = time.time()
             ttl = ttl_sec if ttl_sec is not None and ttl_sec > 0 else self.default_ttl_sec
@@ -77,7 +441,13 @@ class InMemoryUserRegistry:
                 "heartbeat_timeout_sec": self.HEARTBEAT_TIMEOUT_SEC,
             }
             self._users[user_id] = entry
-            logger.info("User registered/updated: user_id=%s, tunnel=%s, ttl=%ss", user_id, clean_tunnel, ttl)
+            self._last_persisted_touch[user_id] = now
+            try:
+                self.backend.save_user(entry)
+            except Exception as exc:
+                logger.error("Failed to persist user %s: %s", user_id, exc)
+
+            logger.info("User registered/updated: user_id=%s, tunnel=%s, ttl=%ss (persisted via %s)", user_id, clean_tunnel, ttl, self.backend.name)
             return dict(entry)
 
     def get(self, user_id: str) -> Optional[Dict[str, Any]]:
@@ -101,12 +471,17 @@ class InMemoryUserRegistry:
             entry = self._users.get(user_id)
             if entry:
                 entry["last_seen"] = 0
+                self._last_persisted_touch[user_id] = 0
+                try:
+                    self.backend.mark_inactive(user_id)
+                except Exception as exc:
+                    logger.warning("Failed to persist mark_inactive for %s: %s", user_id, exc)
                 logger.info("Marked user %s as inactive (last_seen=0)", user_id)
                 return True
             return False
 
     def touch(self, user_id: str) -> bool:
-        """Refresh last_seen heartbeat for an active user session."""
+        """Refresh last_seen heartbeat for an active user session with debounced persistence."""
         with self._lock:
             entry = self._users.get(user_id)
             if not entry:
@@ -115,6 +490,13 @@ class InMemoryUserRegistry:
             registered_at = entry.get("registered_at", entry["last_seen"])
             if (now - registered_at) < entry["ttl_sec"]:
                 entry["last_seen"] = now
+                last_saved = self._last_persisted_touch.get(user_id, 0.0)
+                if (now - last_saved) >= self.TOUCH_DEBOUNCE_SEC:
+                    self._last_persisted_touch[user_id] = now
+                    try:
+                        self.backend.update_touch(user_id, now)
+                    except Exception as exc:
+                        logger.warning("Failed to persist touch for %s: %s", user_id, exc)
                 return True
             return False
 
@@ -174,18 +556,109 @@ class InMemoryUserRegistry:
             return res
 
     def remove(self, user_id: str) -> bool:
-        """Remove user from registry."""
+        """Remove user from registry and durable store."""
         with self._lock:
+            self._last_persisted_touch.pop(user_id, None)
+            try:
+                self.backend.delete_user(user_id)
+            except Exception as exc:
+                logger.warning("Failed to delete user %s from backend: %s", user_id, exc)
             return self._users.pop(user_id, None) is not None
 
     def clear(self) -> None:
-        """Clear all entries (primarily for test resets)."""
+        """Clear all entries from memory and durable store."""
         with self._lock:
             self._users.clear()
+            self._last_persisted_touch.clear()
+            try:
+                self.backend.clear()
+            except Exception as exc:
+                logger.warning("Failed to clear backend: %s", exc)
 
 
-# Global singleton registry
+# Durable alias
+DurableUserRegistry = InMemoryUserRegistry
+
+
+class AntiSleepDaemon:
+    """
+    Background keep-alive daemon that periodically pings the hub's public URL
+    to prevent Render free tier web services from spinning down after 15m idle.
+    """
+
+    def __init__(
+        self,
+        target_url: Optional[str] = None,
+        interval_sec: int = 600,  # 10 minutes (well before 15m idle cutoff)
+        timeout_sec: float = 15.0,
+    ):
+        self.target_url = target_url or os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("HUB_PUBLIC_URL")
+        self.interval_sec = max(60, int(os.environ.get("KEEP_ALIVE_INTERVAL_SEC", str(interval_sec))))
+        self.timeout_sec = timeout_sec
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.last_ping_time: Optional[float] = None
+        self.last_ping_status: Optional[int] = None
+        self.successful_pings: int = 0
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> bool:
+        if not self.target_url:
+            logger.info("AntiSleepDaemon: No target public URL configured (set RENDER_EXTERNAL_URL or HUB_PUBLIC_URL). Daemon idle.")
+            return False
+
+        if self.is_running():
+            return True
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, name="AntiSleepKeepAlive", daemon=True)
+        self._thread.start()
+        logger.info("AntiSleepDaemon started: pinging %s/health every %ss", self.target_url, self.interval_sec)
+        return True
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+            logger.info("AntiSleepDaemon stopped.")
+
+    def ping_now(self) -> Optional[int]:
+        """Perform a single immediate health ping."""
+        if not self.target_url:
+            return None
+        ping_url = f"{self.target_url.rstrip('/')}/health"
+        try:
+            with httpx.Client(timeout=self.timeout_sec) as client:
+                resp = client.get(
+                    ping_url,
+                    headers={"User-Agent": "CloudStream-CentralHub-AntiSleep/1.0"}
+                )
+                self.last_ping_time = time.time()
+                self.last_ping_status = resp.status_code
+                if resp.status_code == 200:
+                    self.successful_pings += 1
+                    logger.info("Anti-sleep keep-alive ping succeeded (HTTP 200) to %s", ping_url)
+                else:
+                    logger.warning("Anti-sleep keep-alive ping returned HTTP %s from %s", resp.status_code, ping_url)
+                return resp.status_code
+        except Exception as exc:
+            self.last_ping_time = time.time()
+            self.last_ping_status = 0
+            logger.warning("Anti-sleep keep-alive ping failed for %s: %s", ping_url, exc)
+            return None
+
+    def _run_loop(self) -> None:
+        self._stop_event.wait(min(30, self.interval_sec))
+        while not self._stop_event.is_set():
+            self.ping_now()
+            self._stop_event.wait(self.interval_sec)
+
+
+# Global singleton registry and keep-alive daemon
 registry = InMemoryUserRegistry(default_ttl_sec=43200)
+keep_alive_daemon = AntiSleepDaemon()
 
 # Request Models
 class RegisterRequest(BaseModel):
@@ -205,11 +678,25 @@ class UnmountRequest(BaseModel):
     filename: str = Field(..., min_length=1, description="Filename of virtual stream to unmount")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Cold start: restore durable state
+    restored = registry.restore_state()
+    if restored > 0:
+        logger.info("Restored %d active registrations from durable storage during startup", restored)
+    # Start anti-sleep daemon if enabled
+    if os.environ.get("ENABLE_KEEP_ALIVE", "1") != "0":
+        keep_alive_daemon.start()
+    yield
+    keep_alive_daemon.stop()
+
+
 # FastAPI Application Setup
 app = FastAPI(
     title="CloudStream Central Pointer Hub",
     description="Zero-bandwidth central router providing dynamic 302 Found WebDAV redirection for Google Cloud Shell backbones",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Enable CORS for all origins (Phone, Android TV, Browser, WebDAV clients)
@@ -228,13 +715,43 @@ hub_router = APIRouter()
 @app.get("/health")
 @app.get("/")
 async def health_check():
-    """Health check endpoint reporting hub status and active user count."""
+    """Health check endpoint reporting hub status, active user count, and persistence engine."""
     return {
         "status": "healthy",
         "service": "cloudstream-central-hub",
         "active_users": registry.get_active_count(),
         "total_registered": registry.get_total_count(),
+        "persistence_engine": getattr(registry.backend, "name", "in_memory"),
+        "keep_alive_active": keep_alive_daemon.is_running(),
         "timestamp": time.time(),
+    }
+
+
+@hub_router.get("/api/hub/persistence")
+async def get_hub_persistence():
+    """Returns telemetry regarding durable storage and keep-alive status."""
+    return {
+        "status": "success",
+        "persistence_engine": getattr(registry.backend, "name", "in_memory"),
+        "active_users": registry.get_active_count(),
+        "total_registered": registry.get_total_count(),
+        "keep_alive_active": keep_alive_daemon.is_running(),
+        "keep_alive_target": keep_alive_daemon.target_url,
+        "keep_alive_interval_sec": keep_alive_daemon.interval_sec,
+        "last_ping_time": keep_alive_daemon.last_ping_time,
+        "last_ping_status": keep_alive_daemon.last_ping_status,
+        "successful_pings": keep_alive_daemon.successful_pings,
+    }
+
+
+@hub_router.post("/api/hub/keep-alive/ping")
+async def trigger_keep_alive_ping():
+    """Manually triggers an immediate anti-sleep ping to public hub URL."""
+    status = keep_alive_daemon.ping_now()
+    return {
+        "status": "success" if status == 200 else "failed",
+        "http_status": status,
+        "target_url": keep_alive_daemon.target_url,
     }
 
 

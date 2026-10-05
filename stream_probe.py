@@ -25,6 +25,60 @@ VIDEO_EXTENSIONS = (
 # Global Real-Time Probe Registry & Shield Events
 probe_tracker: Dict[str, Dict[str, Any]] = {}
 probe_events: Dict[str, asyncio.Event] = {}
+warmed_tails: set = set()
+
+async def warm_mkv_tail(
+    url: str,
+    total_bytes: int,
+    custom_headers: Optional[Dict[str, str]] = None
+) -> bool:
+    """
+    Async background task to warm the tail 64KB (bytes=(total_bytes - 65536)-(total_bytes - 1))
+    for MKV files so Cues index is warmed in origin storage cache.
+    """
+    if total_bytes <= 65536 or not url:
+        return False
+
+    cache_key = f"{url}:{total_bytes}"
+    if cache_key in warmed_tails:
+        return True
+    warmed_tails.add(cache_key)
+
+    tail_start = total_bytes - 65536
+    tail_end = total_bytes - 1
+
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if (parsed.scheme and parsed.netloc) else ""
+
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "*/*",
+        "Range": f"bytes={tail_start}-{tail_end}",
+    }
+    if origin:
+        headers["Referer"] = f"{origin}/"
+        headers["Origin"] = origin
+    if custom_headers:
+        headers.update(custom_headers)
+
+    client_kwargs = {
+        "timeout": PROBE_TIMEOUT,
+        "follow_redirects": True,
+        "verify": False
+    }
+
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code in (200, 206):
+                    async for _ in resp.aiter_bytes():
+                        pass
+                    return True
+                else:
+                    warmed_tails.discard(cache_key)
+    except Exception:
+        warmed_tails.discard(cache_key)
+    return False
 
 def get_probe_event(key: str) -> asyncio.Event:
     """Return or create an asyncio.Event for a given probe_id or filename."""
@@ -454,6 +508,13 @@ async def probe_stream(
         })
         if evt:
             evt.set()
+
+        # Warm tail 64KB (Cues index) for MKV containers in background
+        if is_valid and (is_mkv or ext == ".mkv" or mime == "video/x-matroska") and total_bytes > 65536:
+            try:
+                asyncio.create_task(warm_mkv_tail(final_url or url, total_bytes, custom_headers))
+            except Exception:
+                pass
 
         return {
             "valid": is_valid,

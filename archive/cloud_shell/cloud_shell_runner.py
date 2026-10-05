@@ -101,6 +101,15 @@ def parse_args(argv=None):
         or "https://cloud-stream-bridge.onrender.com"
     )
     default_port = int(os.environ.get("PORT", "7860"))
+    default_tunnel_token = (
+        os.environ.get("TUNNEL_TOKEN")
+        or os.environ.get("CLOUDFLARE_TUNNEL_TOKEN")
+        or ""
+    )
+    default_tunnel_hostname = (
+        os.environ.get("TUNNEL_HOSTNAME")
+        or ""
+    )
 
     parser.add_argument(
         "--user",
@@ -118,12 +127,22 @@ def parse_args(argv=None):
         default=default_port,
         help="Port for local FastAPI server (default: 7860)"
     )
+    parser.add_argument(
+        "--tunnel-token",
+        default=default_tunnel_token,
+        help="Cloudflare Named Tunnel token (default: TUNNEL_TOKEN or CLOUDFLARE_TUNNEL_TOKEN or '')"
+    )
+    parser.add_argument(
+        "--tunnel-hostname",
+        default=default_tunnel_hostname,
+        help="Cloudflare Named Tunnel hostname (e.g. dav.mydomain.com, default: TUNNEL_HOSTNAME or '')"
+    )
     return parser.parse_args(argv)
 
 
-def is_valid_tunnel_url(tunnel_url: str) -> bool:
+def is_valid_tunnel_url(tunnel_url: str, custom_hostname: str = "") -> bool:
     """
-    Validate that tunnel_url is a genuine public Cloudflare tunnel.
+    Validate that tunnel_url is a genuine public Cloudflare tunnel or configured custom hostname.
     Guards strictly against registering localhost or 127.0.0.1 fallback URLs.
     """
     if not tunnel_url or not isinstance(tunnel_url, str):
@@ -131,6 +150,10 @@ def is_valid_tunnel_url(tunnel_url: str) -> bool:
     lower = tunnel_url.lower()
     if "localhost" in lower or "127.0.0.1" in lower:
         return False
+    if custom_hostname and isinstance(custom_hostname, str):
+        clean_custom = custom_hostname.strip().lower()
+        if clean_custom and clean_custom in lower:
+            return True
     return "trycloudflare.com" in lower
 
 
@@ -140,7 +163,8 @@ def register_with_hub(
     tunnel_url: str,
     timeout: float = 15.0,
     verbose: bool = True,
-    log_errors: bool = True
+    log_errors: bool = True,
+    custom_hostname: str = ""
 ) -> bool:
     """
     Sends HTTP POST to {hub_url}/api/register with {"user_id": user_id, "tunnel_url": tunnel_url}.
@@ -152,7 +176,7 @@ def register_with_hub(
         return False
 
     # Guard: Never register localhost or non-trycloudflare URLs as a public tunnel URL
-    if not is_valid_tunnel_url(tunnel_url):
+    if not is_valid_tunnel_url(tunnel_url, custom_hostname=custom_hostname):
         if verbose or log_errors:
             print(f"{RED}[!] Error: Cloudflare tunnel failed to establish. Refusing to register fallback URL '{tunnel_url}' with Central Hub.{RESET}")
         return False
@@ -364,8 +388,8 @@ def launch_server(port: int = 7860) -> subprocess.Popen:
     return server_proc
 
 
-def launch_tunnel(cloudflared_path: str, port: int = 7860) -> subprocess.Popen:
-    """Launch cloudflared tunnel pointing to http://localhost:{port}."""
+def launch_tunnel(cloudflared_path: str, port: int = 7860, tunnel_token: str = "") -> subprocess.Popen:
+    """Launch cloudflared tunnel pointing to http://localhost:{port} or using a named tunnel token."""
     global tunnel_proc
     if os.path.exists(TUNNEL_LOG):
         try:
@@ -374,7 +398,10 @@ def launch_tunnel(cloudflared_path: str, port: int = 7860) -> subprocess.Popen:
             pass
 
     log_file = open(TUNNEL_LOG, "w", encoding="utf-8")
-    tunnel_cmd = [cloudflared_path, "tunnel", "--url", f"http://localhost:{port}"]
+    if tunnel_token:
+        tunnel_cmd = [cloudflared_path, "tunnel", "run", "--token", tunnel_token]
+    else:
+        tunnel_cmd = [cloudflared_path, "tunnel", "--url", f"http://localhost:{port}"]
     extra_kwargs = {"start_new_session": True} if os.name != "nt" else {}
     tunnel_proc = subprocess.Popen(
         tunnel_cmd,
@@ -387,17 +414,60 @@ def launch_tunnel(cloudflared_path: str, port: int = 7860) -> subprocess.Popen:
     return tunnel_proc
 
 
+def probe_tunnel_health(tunnel_url: str, timeout: float = 4.0) -> bool:
+    """
+    Sends an HTTP GET probe to f"{tunnel_url.rstrip('/')}/health" with 4.0s timeout.
+    Detects Cloudflare 530 / 502 / 503 / 504 errors and Error 1033 tunnel drops.
+    Returns True if 200 <= status < 400, False otherwise.
+    """
+    if not tunnel_url or not isinstance(tunnel_url, str):
+        return False
+    health_url = f"{tunnel_url.rstrip('/')}/health"
+    req = urllib.request.Request(
+        health_url,
+        headers={"User-Agent": "CloudStreamProbe/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", getattr(resp, "code", 200))
+            return 200 <= status < 400
+    except urllib.error.HTTPError as e:
+        if e.code in (502, 503, 504, 530):
+            return False
+        err_msg = str(getattr(e, "reason", "") or "")
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+            if "1033" in body or "error 1033" in body.lower():
+                return False
+        except Exception:
+            pass
+        if "1033" in err_msg.lower():
+            return False
+        return False
+    except (urllib.error.URLError, TimeoutError):
+        return False
+    except Exception:
+        return False
+
+
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 CLOUDFLARE_URL_PATTERN = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 
 
-def extract_tunnel_url(timeout_secs: int = 45) -> str:
+def extract_tunnel_url(timeout_secs: int = 45, custom_hostname: str = "") -> str:
     """
-    Extract public trycloudflare URL from tunnel.log within timeout period.
+    Extract public trycloudflare URL from tunnel.log within timeout period,
+    or return configured custom_hostname.
     Strips ANSI escape sequences from stdout/stderr lines before applying regex.
     Logs success or failure clearly.
     """
     global tunnel_proc
+    if custom_hostname:
+        clean = custom_hostname.strip()
+        url = clean if (clean.startswith("http://") or clean.startswith("https://")) else f"https://{clean}"
+        print(f"{GREEN}[✓] Using configured Cloudflare tunnel hostname: {url}{RESET}")
+        return url
+
     print(f"{CYAN}[*] Extracting high-speed public tunnel URL (up to {timeout_secs}s)...{RESET}")
     start = time.time()
 
@@ -485,7 +555,8 @@ def print_banner(
     tunnel_url: str,
     mount_count: int,
     user_id: str = "default",
-    hub_url: str = "https://cloud-stream-bridge.onrender.com"
+    hub_url: str = "https://cloud-stream-bridge.onrender.com",
+    tunnel_hostname: str = ""
 ):
     """Print visually stunning ANSI box with Step 2 status and Step 3 CX File Explorer setup."""
     clean_hub = hub_url.rstrip("/")
@@ -538,6 +609,8 @@ def run_heartbeat_loop(
     cloudflared_bin: str = "",
     auto_restart: bool = False,
     max_restarts: int = 10,
+    tunnel_token: str = "",
+    tunnel_hostname: str = "",
 ):
     """
     12-Hour Anti-Idle Heartbeat Keep-Alive Loop with Self-Healing Tunnel Supervisor.
@@ -558,16 +631,24 @@ def run_heartbeat_loop(
 
     while True:
         try:
-            if tunnel_proc is not None and tunnel_proc.poll() is not None:
-                ret = tunnel_proc.poll()
+            tunnel_dead = (tunnel_proc is not None and tunnel_proc.poll() is not None)
+            tunnel_unhealthy = False
+            if not tunnel_dead and auto_restart and tunnel_url and is_valid_tunnel_url(tunnel_url, custom_hostname=tunnel_hostname):
+                if not probe_tunnel_health(tunnel_url):
+                    tunnel_unhealthy = True
+
+            if tunnel_dead or tunnel_unhealthy:
+                ret = tunnel_proc.poll() if (tunnel_proc is not None) else None
                 if not auto_restart or restarts_count >= max_restarts:
-                    print(f"\n{YELLOW}[!] Cloudflared tunnel died: process exited with exit code {ret}. Stopping heartbeat loop.{RESET}")
+                    reason = f"process exited with exit code {ret}" if tunnel_dead else "health probe failed"
+                    print(f"\n{YELLOW}[!] Cloudflared tunnel died ({reason}). Stopping heartbeat loop.{RESET}")
                     break
 
                 restarts_count += 1
-                print(f"\n{YELLOW}[!] cloudflared disconnected (exit code {ret}, restart {restarts_count}/{max_restarts}). Auto-restarting tunnel supervisor...{RESET}")
+                reason = f"exit code {ret}" if tunnel_dead else "health probe failed"
+                print(f"\n{YELLOW}[!] cloudflared disconnected ({reason}, restart {restarts_count}/{max_restarts}). Auto-restarting tunnel supervisor...{RESET}")
                 try:
-                    if tunnel_proc is not None:
+                    if tunnel_proc is not None and tunnel_proc.poll() is None:
                         tunnel_proc.terminate()
                         tunnel_proc.wait(timeout=2)
                 except Exception:
@@ -588,12 +669,17 @@ def run_heartbeat_loop(
                         pass
                 time.sleep(1)
 
-                launch_tunnel(cloudflared_bin, port=port)
-                new_url = extract_tunnel_url(timeout_secs=45)
-                if is_valid_tunnel_url(new_url):
+                launch_tunnel(cloudflared_bin, port=port, tunnel_token=tunnel_token)
+                if tunnel_hostname:
+                    clean_h = tunnel_hostname.strip()
+                    new_url = clean_h if (clean_h.startswith("http://") or clean_h.startswith("https://")) else f"https://{clean_h}"
+                else:
+                    new_url = extract_tunnel_url(timeout_secs=45, custom_hostname=tunnel_hostname)
+
+                if is_valid_tunnel_url(new_url, custom_hostname=tunnel_hostname):
                     tunnel_url = new_url
                     if clean_hub:
-                        register_with_hub(clean_hub, user_id, tunnel_url)
+                        register_with_hub(clean_hub, user_id, tunnel_url, custom_hostname=tunnel_hostname)
                 continue
 
             pulse_count += 1
@@ -611,8 +697,8 @@ def run_heartbeat_loop(
 
             # Hub keep-alive pulse (refresh 12-hour TTL on central hub)
             hub_synced = False
-            if clean_hub and is_valid_tunnel_url(tunnel_url):
-                hub_synced = register_with_hub(clean_hub, user_id, tunnel_url, timeout=15.0, verbose=False, log_errors=True)
+            if clean_hub and is_valid_tunnel_url(tunnel_url, custom_hostname=tunnel_hostname):
+                hub_synced = register_with_hub(clean_hub, user_id, tunnel_url, timeout=15.0, verbose=False, log_errors=True, custom_hostname=tunnel_hostname)
                 if not hub_synced:
                     print(f"{YELLOW}[!] Hub heartbeat desync: Registration refresh failed for {clean_hub} (device: {user_id}){RESET}")
                 hub_status_str = f"{GREEN}SYNCED [✓]{RESET}" if hub_synced else f"{YELLOW}DESYNC [!]{RESET}"
@@ -650,6 +736,8 @@ def main():
     user_id = args.user
     hub_url = args.hub
     port = args.port
+    tunnel_token = args.tunnel_token
+    tunnel_hostname = args.tunnel_hostname
 
     # Register OS signal traps
     signal.signal(signal.SIGINT, cleanup_and_exit)
@@ -661,6 +749,8 @@ def main():
     print(f"\n{BOLD}{CYAN}=== Step 2: Google Cloud Shell Launcher (CloudStream Bridge) ==={RESET}")
     print(f"{CYAN}[*] Unique Device Username: {BOLD}{user_id}{RESET} (Zero Google Sign-In)")
     print(f"{CYAN}[*] Central Hub URL:         {BOLD}{hub_url}{RESET}")
+    if tunnel_hostname:
+        print(f"{CYAN}[*] Tunnel Hostname:         {BOLD}{tunnel_hostname}{RESET}")
 
     # 1. Setup persistent storage
     mount_count = setup_persistent_storage()
@@ -678,10 +768,14 @@ def main():
     launch_server(port=port)
 
     # 6. Launch Cloudflare tunnel
-    launch_tunnel(cloudflared_bin, port=port)
+    launch_tunnel(cloudflared_bin, port=port, tunnel_token=tunnel_token)
 
     # 7. Extract public tunnel URL
-    tunnel_url = extract_tunnel_url(timeout_secs=45)
+    if tunnel_token and tunnel_hostname:
+        clean_h = tunnel_hostname.strip()
+        tunnel_url = clean_h if (clean_h.startswith("http://") or clean_h.startswith("https://")) else f"https://{clean_h}"
+    else:
+        tunnel_url = extract_tunnel_url(timeout_secs=45, custom_hostname=tunnel_hostname)
 
     if not tunnel_url:
         print(f"\n{YELLOW}[!] Warning: Could not automatically parse trycloudflare URL within 45s.{RESET}")
@@ -689,20 +783,29 @@ def main():
         tunnel_url = f"http://localhost:{port}"
 
     # Guard: Ensure it NEVER registers http://localhost or http://127.0.0.1 as a public tunnel URL.
-    # If the tunnel URL is localhost or does not contain trycloudflare.com, it must NOT register
+    # If the tunnel URL is localhost or does not contain trycloudflare.com (or custom hostname), it must NOT register
     # and must log an error that the tunnel failed to establish.
-    if is_valid_tunnel_url(tunnel_url):
-        register_with_hub(hub_url, user_id, tunnel_url, timeout=15.0, verbose=True)
+    if is_valid_tunnel_url(tunnel_url, custom_hostname=tunnel_hostname):
+        register_with_hub(hub_url, user_id, tunnel_url, timeout=15.0, verbose=True, custom_hostname=tunnel_hostname)
     else:
         print(f"\n{RED}[!] Error: Cloudflare tunnel failed to establish. Local fallback URL '{tunnel_url}' will NOT be registered with Central Hub!{RESET}")
 
     # 8. Display ASCII QR Code & ANSI Banner
-    if is_valid_tunnel_url(tunnel_url):
+    if is_valid_tunnel_url(tunnel_url, custom_hostname=tunnel_hostname):
         print_ascii_qr(tunnel_url)
-    print_banner(tunnel_url, mount_count, user_id=user_id, hub_url=hub_url)
+    print_banner(tunnel_url, mount_count, user_id=user_id, hub_url=hub_url, tunnel_hostname=tunnel_hostname)
 
     # 9. Enter anti-idle heartbeat loop
-    run_heartbeat_loop(hub_url=hub_url, user_id=user_id, tunnel_url=tunnel_url, port=port, cloudflared_bin=cloudflared_bin, auto_restart=True)
+    run_heartbeat_loop(
+        hub_url=hub_url,
+        user_id=user_id,
+        tunnel_url=tunnel_url,
+        port=port,
+        cloudflared_bin=cloudflared_bin,
+        auto_restart=True,
+        tunnel_token=tunnel_token,
+        tunnel_hostname=tunnel_hostname
+    )
 
     cleanup_and_exit()
 

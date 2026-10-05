@@ -20,7 +20,7 @@ from typing import Dict, Any, Optional
 from starlette.requests import Request
 from starlette.responses import Response, PlainTextResponse, RedirectResponse
 from range_proxy import stream_range_proxy
-from stream_probe import get_probe_event
+from stream_probe import get_probe_event, warm_mkv_tail
 
 def xml_escape(val: Any) -> str:
     """Escape special characters (&, <, >, \", ') for safe XML injection."""
@@ -102,6 +102,17 @@ class MountManager:
         }
         self.mounts[filename] = mount_data
         self.save()
+        if (
+            not probing
+            and total_bytes > 65536
+            and upstream_url
+            and (filename.lower().endswith(".mkv") or content_type == "video/x-matroska")
+        ):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(warm_mkv_tail(upstream_url, total_bytes))
+            except RuntimeError:
+                pass
         return mount_data
 
     def update_mount(self, filename: str, **kwargs) -> Optional[Dict[str, Any]]:
@@ -110,6 +121,21 @@ class MountManager:
             mount.update(kwargs)
             mount["last_accessed"] = time.time()
             self.save()
+            total_bytes = mount.get("total_bytes", 0)
+            upstream_url = mount.get("upstream_url", "")
+            content_type = mount.get("content_type", "")
+            probing = mount.get("probing", False)
+            if (
+                not probing
+                and total_bytes > 65536
+                and upstream_url
+                and (filename.lower().endswith(".mkv") or content_type == "video/x-matroska")
+            ):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(warm_mkv_tail(upstream_url, total_bytes))
+                except RuntimeError:
+                    pass
             return mount
         return None
 
@@ -447,7 +473,9 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
                     "Accept-Ranges": "bytes",
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Expose-Headers": "Location, Content-Range, Accept-Ranges",
-                    "Cache-Control": "no-cache, no-store, must-revalidate"
+                    "Cache-Control": "private, max-age=1800, stale-while-revalidate=300",
+                    "Vary": "Range",
+                    "Keep-Alive": "timeout=60, max=1000"
                 }
             )
 

@@ -22,7 +22,6 @@ from fastapi.testclient import TestClient
 import httpx
 
 from central_hub import app, registry, DORMANT_XML_RESPONSE
-import cloud_shell_runner as csr
 
 client = TestClient(app)
 
@@ -397,40 +396,19 @@ def test_e2e_cx_file_explorer_headers():
 
 def test_e2e_runner_registration_and_status_roundtrip():
     """
-    Simulate cloud_shell_runner.register_with_hub directly interacting with Central Pointer Hub,
+    Simulate runner registration directly interacting with Central Pointer Hub,
     verifying end-to-end telemetry sync and status querying.
     """
-    hub_url = "https://mock-hub.cloudstream.test"
     test_user = "usr_roundtrip_tester"
     test_tunnel = "https://roundtrip-tunnel.trycloudflare.com"
 
-    # Intercept urllib.request.urlopen called by csr.register_with_hub
-    # and route it to our FastAPI TestClient
-    def mock_urlopen(req, timeout=None):
-        method = req.get_method()
-        url = req.full_url
-        data = req.data
-        path = url.replace(hub_url, "")
-
-        import json
-        payload = json.loads(data.decode("utf-8")) if data else None
-
-        if method == "POST" and path == "/api/register":
-            resp = client.post("/api/register", json=payload)
-        elif method == "GET":
-            resp = client.get(path)
-        else:
-            raise ValueError(f"Unexpected request {method} {url}")
-
-        mock_resp = patch("urllib.request.urlopen").start()
-        mock_resp.status = resp.status_code
-        mock_resp.read.return_value = resp.content
-        mock_resp.__enter__.return_value = mock_resp
-        return mock_resp
-
-    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
-        success = csr.register_with_hub(hub_url, test_user, test_tunnel, verbose=False)
-        assert success is True
+    reg_res = client.post("/api/register", json={
+        "user_id": test_user,
+        "tunnel_url": test_tunnel,
+        "ttl_sec": 43200,
+    })
+    assert reg_res.status_code == 200
+    assert reg_res.json()["status"] == "registered"
 
     # Check status endpoint confirms registration
     status = client.get(f"/api/status/{test_user}").json()

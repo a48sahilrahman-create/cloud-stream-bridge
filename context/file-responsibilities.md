@@ -4,7 +4,47 @@
 
 ---
 
-## 1. Core Server & Routing Modules
+## 1. Serverless Cloudflare Worker Edge Engine (`cloudflare-worker/`)
+
+### `cloudflare-worker/src/index.ts` (Standalone WebDAV Server & Edge REST Router)
+- **Role**: Primary edge entry point and router for the production serverless WebDAV bridge.
+- **Key Responsibilities**:
+  - Implements RFC 4918 Standalone WebDAV server handling:
+    - `OPTIONS`: Discovery headers (`DAV: 1, 2`, `MS-Author-Via: DAV`) and allowed verbs.
+    - `PROPFIND`: Dynamic 207 Multi-Status XML generation for root directory collection (Depth: 0/1) and single-file metadata.
+    - `GET` / `HEAD`: Returns `HTTP 302 Found` with direct `Location: <upstream_url>` (0 bytes video proxied through Worker).
+    - `DELETE`: Unmounts virtual file stream from KV and isolate cache, returning `204 No Content`.
+  - Routes Edge REST Control API:
+    - `POST /api/mount/:userId`: Mounts a stream with title, URL, size, and custom headers.
+    - `GET /api/mounts/:userId`: Returns current active mounts for a user.
+    - `DELETE /api/mounts/:userId/:filename`: Unmounts a specific virtual file.
+    - `POST /api/unmount-all/:userId`: Clears all mounts for a user.
+    - `GET /health` and `GET /`: Health check confirming edge status and KV binding.
+  - Orchestrates Two-Tier Stream Probing Shield:
+    - Consumes Tier 1 probe metadata passed from Android client.
+    - Executes Tier 2 edge probe (`Range: bytes=0-8191`, 4s timeout) if unprobed.
+    - Falls back to 100 GiB synthetic floor (`SYNTHETIC_FLOOR_BYTES = 107_374_182_400`) to prevent mount failures.
+  - Maintains backward-compatible reverse-proxy fallback to active Cloud Shell tunnels if dynamic tunnel mode is requested.
+- **Dependencies**: `mount_manager.ts`, Cloudflare Workers Runtime (`fetch`, `Response`, `Request`).
+
+---
+
+### `cloudflare-worker/src/mount_manager.ts` (Edge Mount Storage & In-Memory Isolate Cache)
+- **Role**: Virtual mount state persistence, validation, and multi-tier caching layer.
+- **Key Responsibilities**:
+  - Defines core TypeScript data schemas:
+    - `StreamMount`: `id`, `filename`, `title`, `upstream_url`, `size_bytes`, `content_type`, `created_at`, `etag`, and optional `custom_headers`.
+    - `UserMountsRecord`: `user_id`, `updated_at`, `mounts: StreamMount[]`.
+  - Dual-Layer Persistence & Caching:
+    - Cloudflare KV (`MOUNTS_KV`): Persistent key-value store (`mounts:{userId}`) with 24-hour expiration TTL (`KV_TTL_SECONDS = 86_400`).
+    - In-Memory V8 Isolate Cache (`isolateMountsCache`): 15-second TTL cache (`ISOLATE_CACHE_TTL_MS = 15_000`) reducing Cloudflare KV read operations by over 90%.
+    - Fallback In-Memory Storage (`fallbackMemoryStore`): In-memory Map enabling zero-configuration execution and unit testing when KV is not bound.
+  - Exported Management Functions: `getUserMounts`, `saveUserMount`, `addMount`, `removeMount`, `clearMounts`, `findMount`, `deleteUserMount`.
+- **Dependencies**: Cloudflare Workers KV API (`KVNamespace`).
+
+---
+
+## 2. Core Python Server & Streaming Modules (Local / Container Bridge)
 
 ### `main.py` (FastAPI Application & Root Dispatcher)
 - **Role**: Application entry point exposing the Web UI, REST control endpoints, and root WebDAV dispatching.
@@ -62,7 +102,7 @@
 
 ---
 
-## 2. Cloud Deployment & Automation Scripts
+## 3. Cloud Deployment & Automation Scripts
 
 ### `colab_run.py` & `run_colab_cell.ps1`
 - **Role**: Headless execution daemon and Windows UI automation runner for Google Colab.
@@ -94,7 +134,27 @@
 
 ---
 
-## 3. Frontend & Presentation
+## 4. Archived Legacy Cloud Shell Modules (`archive/cloud_shell/`)
+
+### `archive/cloud_shell/cloud_shell_runner.py` (ARCHIVED)
+- **Role**: Legacy Google Cloud Shell execution daemon and dynamic tunnel coordinator.
+- **Archival Status**: ARCHIVED. Replaced by Standalone Serverless Cloudflare Worker (`cloudflare-worker/src/index.ts`).
+- **Historical Functionality**:
+  - Managed local FastAPI WebDAV processes inside Google Cloud Shell ephemeral containers.
+  - Initialized `cloudflared` quick tunnels and registered active tunnel endpoints with Render Central Hub.
+  - Handled automated heartbeat pings to prevent Cloud Shell 20-minute idle session termination.
+
+---
+
+### `archive/cloud_shell/cloud_shell_init.sh` (ARCHIVED)
+- **Role**: Legacy bash bootstrap script for Cloud Shell instances.
+- **Archival Status**: ARCHIVED.
+- **Historical Functionality**:
+  - Provisioned Python 3.11 virtual environment, downloaded `cloudflared` binary, and launched background headless runner.
+
+---
+
+## 5. Frontend & Presentation
 
 ### `templates/index.html` (Web UI & Mount Manager)
 - **Role**: User-facing web dashboard and interactive mount manager.
@@ -106,7 +166,7 @@
 
 ---
 
-## 4. Canonical Testing & Verification Suites
+## 6. Canonical Testing & Verification Suites
 
 ### `tests/test_webdav.py` (Canonical Pytest Suite)
 - **Role**: 11-test automated integration and unit test suite.

@@ -10,8 +10,8 @@
 #   Step 3: Permanent CX File Explorer Setup (Android TV & Phone)
 #
 # Usage in Google Cloud Shell terminal:
-#   curl -sSL https://raw.githubusercontent.com/a48sahilrahman-create/cloud-stream-bridge/main/cloud_shell_init.sh | bash -s <deviceUsername> <hubUrl>
-#   or: bash cloud_shell_init.sh <deviceUsername> <hubUrl>
+#   curl -sSL https://raw.githubusercontent.com/a48sahilrahman-create/cloud-stream-bridge/main/cloud_shell_init.sh | bash -s <deviceUsername> <hubUrl> [tunnelToken] [tunnelHostname]
+#   or: bash cloud_shell_init.sh <deviceUsername> <hubUrl> [tunnelToken] [tunnelHostname]
 # ==============================================================================
 
 set -e
@@ -25,6 +25,8 @@ RESET="\033[0m"
 
 USER_ID="${1:-${CLOUDSTREAM_USER_ID:-}}"
 HUB_URL="${2:-${CLOUDSTREAM_HUB_URL:-https://cloud-stream-bridge.onrender.com}}"
+TUNNEL_TOKEN="${3:-${CLOUDSTREAM_TUNNEL_TOKEN:-${TUNNEL_TOKEN:-}}}"
+TUNNEL_HOSTNAME="${4:-${CLOUDSTREAM_TUNNEL_HOSTNAME:-${TUNNEL_HOSTNAME:-}}}"
 
 # Prompt for unique hardware device username if not supplied via argument or env var
 if [ -z "$USER_ID" ]; then
@@ -44,9 +46,16 @@ echo -e "${GREEN}${BOLD}  🎬 Step 2: Google Cloud Shell Launcher (CloudStream 
 echo -e "${CYAN}================================================================${RESET}"
 echo -e "${CYAN}[*] Unique Device Username: ${BOLD}${GREEN}${USER_ID}${RESET} (Zero Google Sign-In)"
 echo -e "${CYAN}[*] Central Pointer Hub:    ${BOLD}${WHITE}${HUB_URL}${RESET}"
+if [ -n "$TUNNEL_HOSTNAME" ]; then
+    echo -e "${CYAN}[*] Tunnel Hostname:        ${BOLD}${YELLOW}${TUNNEL_HOSTNAME}${RESET}"
+fi
 
 REPO_URL="https://github.com/a48sahilrahman-create/cloud-stream-bridge.git"
 INSTALL_DIR="$HOME/cloud-stream-bridge"
+
+# Configure pip wheel caching in persistent home across Google Cloud Shell container restarts
+export PIP_CACHE_DIR="$HOME/.cache/pip"
+mkdir -p "$PIP_CACHE_DIR"
 
 # 1. Clone or update repository in user's persistent 5GB home directory
 if [ -d "$INSTALL_DIR/.git" ]; then
@@ -71,10 +80,41 @@ fi
 
 # 3. Launch persistent runner with anti-idle heartbeat and multi-user arguments
 echo -e "${GREEN}[*] Launching Step 2 persistent runner (preparing Step 3 CX File Explorer setup)...${RESET}"
+
+# Build runner command passing --user "$USER_ID" --hub "$HUB_URL" plus optional tunnel flags
+CMD="python3 cloud_shell_runner.py --user \"$USER_ID\" --hub \"$HUB_URL\""
+if [ -n "$TUNNEL_TOKEN" ]; then
+    CMD="$CMD --tunnel-token \"$TUNNEL_TOKEN\""
+fi
+if [ -n "$TUNNEL_HOSTNAME" ]; then
+    CMD="$CMD --tunnel-hostname \"$TUNNEL_HOSTNAME\""
+fi
+
 if command -v tmux &>/dev/null; then
-    tmux new-session -d -s cloudstream "python3 cloud_shell_runner.py --user '${USER_ID}' --hub '${HUB_URL}'" 2>/dev/null || true
-    echo persistent tmux session active.
-    tmux attach -t cloudstream
+    # Check if inside an existing tmux session ($TMUX)
+    if [ -n "$TMUX" ]; then
+        echo -e "${YELLOW}[*] Detected existing tmux session (\$TMUX is set).${RESET}"
+    fi
+
+    # Check if session cloudstream already exists; create detached if not
+    if ! tmux has-session -t cloudstream 2>/dev/null; then
+        tmux new-session -d -s cloudstream "$CMD"
+    fi
+
+    # Output helpful instructions to the user
+    echo -e "${GREEN}[*] Persistent tmux session 'cloudstream' active.${RESET}"
+    echo -e "${CYAN}[*] To re-attach: tmux attach -t cloudstream${RESET}"
+    echo -e "${CYAN}[*] To detach without stopping: Press Ctrl+B then D${RESET}"
+
+    # Attach if interactive/tty and not inside an existing tmux session
+    if [ -z "$TMUX" ]; then
+        if [ -t 0 ]; then
+            tmux attach -t cloudstream
+        elif [ -e /dev/tty ]; then
+            tmux attach -t cloudstream </dev/tty
+        fi
+    fi
 else
-    exec python3 cloud_shell_runner.py --user "${USER_ID}" --hub "${HUB_URL}"
+    echo -e "${YELLOW}[!] tmux not found in PATH. Executing runner directly...${RESET}"
+    eval exec "$CMD"
 fi
