@@ -255,6 +255,11 @@ function renderMountFileXml(userId: string, mount: StreamMount): string {
     .map((seg) => encodeURIComponent(seg))
     .join("/");
 
+  const contentType =
+    mount.content_type && mount.content_type !== "application/octet-stream"
+      ? mount.content_type
+      : inferContentType(mount.filename);
+
   return `  <D:response>
     <D:href>/dav/${encodeURIComponent(userId)}/${encodedFilename}</D:href>
     <D:propstat>
@@ -262,7 +267,7 @@ function renderMountFileXml(userId: string, mount: StreamMount): string {
         <D:displayname>${escapeXml(mount.filename)}</D:displayname>
         <D:resourcetype/>
         <D:getcontentlength>${mount.size_bytes}</D:getcontentlength>
-        <D:getcontenttype>${escapeXml(mount.content_type || "video/mp4")}</D:getcontenttype>
+        <D:getcontenttype>${escapeXml(contentType)}</D:getcontenttype>
         <D:getetag>${escapeXml(mount.etag)}</D:getetag>
         <D:getlastmodified>${formatWebDavDate(mount.created_at)}</D:getlastmodified>
         <D:supportedlock>
@@ -859,14 +864,16 @@ export default {
         const mount = await findMount(env, userId, decodedTargetFilename);
         if (mount) {
           const totalBytes = mount.size_bytes > 0 ? mount.size_bytes : SYNTHETIC_FLOOR_BYTES;
-          const contentType = isGoogleCdn(mount.upstream_url)
-            ? "video/mp4"
-            : (mount.content_type || inferContentType(mount.filename));
+          const contentType =
+            mount.content_type && mount.content_type !== "application/octet-stream"
+              ? mount.content_type
+              : inferContentType(mount.filename);
+          const acceptRanges = isGoogleCdn(mount.upstream_url) ? "none" : "bytes";
           return new Response(null, {
             status: 200,
             statusText: "OK",
             headers: {
-              "Accept-Ranges": "bytes",
+              "Accept-Ranges": acceptRanges,
               "Content-Type": contentType,
               "Content-Length": totalBytes.toString(),
               "Last-Modified": formatWebDavDate(mount.created_at || Date.now()),
@@ -970,7 +977,10 @@ export default {
             });
 
             const responseHeaders = new Headers();
-            responseHeaders.set("Accept-Ranges", "bytes");
+            responseHeaders.set(
+              "Accept-Ranges",
+              isGoogleCdn(mount.upstream_url) ? "none" : "bytes"
+            );
             responseHeaders.set("Access-Control-Allow-Origin", "*");
             responseHeaders.set(
               "Access-Control-Expose-Headers",
@@ -999,22 +1009,38 @@ export default {
 
             responseHeaders.set("Content-Type", effectiveContentType);
 
-            const upstreamContentRange = upstreamResp.headers.get("Content-Range");
-            if (upstreamContentRange) {
-              responseHeaders.set("Content-Range", upstreamContentRange);
-            } else if (clientRange && mount.size_bytes > 0) {
-              const contentLen = upstreamResp.headers.get("Content-Length");
-              if (contentLen) {
-                responseHeaders.set(
-                  "Content-Range",
-                  `bytes 0-${parseInt(contentLen, 10) - 1}/${mount.size_bytes}`
-                );
-              }
-            }
+            const totalBytes = mount.size_bytes > 0 ? mount.size_bytes : SYNTHETIC_FLOOR_BYTES;
+            const rangeHeader = clientRange;
+            const responseStatus =
+              upstreamResp.status === 200 && rangeHeader ? 206 : upstreamResp.status;
+            const responseStatusText =
+              responseStatus === 206 ? "Partial Content" : upstreamResp.statusText;
 
+            const upstreamContentRange = upstreamResp.headers.get("Content-Range");
             const upstreamContentLength = upstreamResp.headers.get("Content-Length");
-            if (upstreamContentLength) {
-              responseHeaders.set("Content-Length", upstreamContentLength);
+
+            if (responseStatus === 206) {
+              if (upstreamContentRange) {
+                responseHeaders.set("Content-Range", upstreamContentRange);
+              } else {
+                const len = upstreamContentLength
+                  ? parseInt(upstreamContentLength, 10)
+                  : totalBytes;
+                responseHeaders.set("Content-Range", `bytes 0-${len - 1}/${totalBytes}`);
+              }
+              if (upstreamContentLength) {
+                responseHeaders.set("Content-Length", upstreamContentLength);
+              } else {
+                responseHeaders.set("Content-Length", totalBytes.toString());
+              }
+            } else {
+              // RFC 9110 Section 14.4: NEVER emit Content-Range on HTTP 200 OK
+              responseHeaders.delete("Content-Range");
+              if (upstreamContentLength) {
+                responseHeaders.set("Content-Length", upstreamContentLength);
+              } else if (mount.size_bytes > 0) {
+                responseHeaders.set("Content-Length", mount.size_bytes.toString());
+              }
             }
 
             responseHeaders.set(
@@ -1030,8 +1056,8 @@ export default {
             responseHeaders.set("Cache-Control", "public, max-age=3600");
 
             return new Response(upstreamResp.body, {
-              status: upstreamResp.status,
-              statusText: upstreamResp.statusText,
+              status: responseStatus,
+              statusText: responseStatusText,
               headers: responseHeaders,
             });
           } catch (err: any) {

@@ -1,6 +1,24 @@
 # Changelog & Architectural State — CloudStream WebDAV Bridge
 
 ## Current State
+- **Google CDN Stream Playback & Stuttering Resolution Deployed & Verified**:
+  - **Plan Executed**: `plans/google-cdn-streaming-cx-vlc-resolution-plan.md` (all 5 steps complete).
+  - **Files Modified**:
+    - `cloudflare-worker/src/index.ts`: Preserved Matroska/true MIME types (`video/x-matroska`), advertised `accept-ranges: none` for Google CDN streams, synthesized `HTTP 206 Partial Content` with valid `Content-Range` for Range requests when upstream returns 200, strictly stripped `Content-Range` on 200 OK per RFC 9110 Section 14.4.
+    - `cloudflare-worker/test_worker.js`: Added Tests 30–32; 32/32 tests passing (100%).
+    - `webdav_engine.py`: Fixed `infer_video_type` to retain `video/x-matroska`, advertised `Accept-Ranges: none` on Google CDN.
+    - `tests/test_google_stream_turbo.py`: Updated assertions for Matroska and `Accept-Ranges: none`; 81/81 pytest tests passing.
+  - **Edge Deployment**: Cloudflare Worker deployed live (`npx wrangler deploy`, Version ID `c44da0e8-0b54-469b-8e54-47c3cfbe22df`).
+  - **Live cURL Verification**: Verified HEAD returns `video/x-matroska` and `accept-ranges: none`, GET with Range returns synthetic `206 Partial Content` + `Content-Range`, GET without Range returns `200 OK` with zero `Content-Range`.
+  - **On-Device Verification**: Realme X7 Max 5G (`RMX3031`, Android 13) via wireless ADB `172.19.11.121:5555`; verified zero ExoPlayer / Media3 `PlaybackException` / `0x7f130158` crashes.
+- **Google CDN MKV Playback & Stuttering Diagnostic Complete (CX File Explorer & VLC/MPV)**:
+  - **Plan Created**: `plans/google-cdn-streaming-cx-vlc-resolution-plan.md` & `C:\Users\sahil\.claude\plans\google-cdn-streaming-cx-vlc-resolution-plan.md`.
+  - **Triple-Compound Root Cause Diagnosed via Wireless ADB (`RMX3031`) & Codebase Audit**:
+    1. **Google UploadServer Invariant**: Endpoints on `video-downloads.googleusercontent.com` completely ignore HTTP `Range` headers, unconditionally returning `200 OK` from byte 0.
+    2. **RFC 9110 Violation & 200 OK Content-Range Bug**: Worker emitted `Content-Range: bytes 0-.../...` on `HTTP 200 OK`, crashing AndroidX Media3 / ExoPlayer's `DefaultHttpDataSource` in CX File Explorer (`PlaybackException` -> `0x7f130158` "Playback error").
+    3. **MIME Type Sniffing Bug**: Worker hardcoded `video/mp4` on HEAD probes for all Google URLs, forcing `Mp4Extractor` on Matroska containers and failing on EBML headers.
+    4. **MKV Tail Seek Thrashing in VLC & MPV**: MKV EBML Cues index at file tail (~19.55 GB). `Accept-Ranges: bytes` caused players to request container tail; Google sent byte 0; players aborted socket (`ECONNRESET`) in an infinite reconnect loop.
+  - **Ready for Implementation**: Synthetic 206 Partial Content, RFC 9110 compliance, MIME preservation (`video/x-matroska`), and `Accept-Ranges: none` progressive stream signaling.
 - **Google CDN Turbo Streaming & Edge Shield Engine Deployed (`cloudflare-worker/src/index.ts`, `webdav_engine.py`, `range_proxy.py`, `stream_probe.py`)**:
   - **Core Diagnosis & Multi-Player Failure Matrix**:
     - Identified quadruple-compound failure mode on `video-downloads.googleusercontent.com` and Google CDN video streams:

@@ -78,7 +78,7 @@ def infer_video_type(filename: str, current_type: Optional[str] = None) -> str:
     }
     if ext in ext_map:
         return ext_map[ext]
-    if current_type and current_type.startswith("video/") and current_type not in ("video/octet-stream", "video/x-matroska"):
+    if current_type and current_type.startswith("video/") and current_type != "video/octet-stream":
         return current_type
     return "video/mp4"
 
