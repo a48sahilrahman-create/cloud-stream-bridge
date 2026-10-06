@@ -76,10 +76,10 @@ def infer_video_type(filename: str, current_type: Optional[str] = None) -> str:
         ".ogv": "video/ogg",
         ".3gp": "video/3gpp"
     }
-    if ext in ext_map:
-        return ext_map[ext]
     if current_type and current_type.startswith("video/") and current_type != "video/octet-stream":
         return current_type
+    if ext in ext_map:
+        return ext_map[ext]
     return "video/mp4"
 
 # Mount registry store
@@ -127,7 +127,9 @@ class MountManager:
         formatted_size: str,
         title: Optional[str] = None,
         probing: bool = False,
-        probe_id: Optional[str] = None
+        probe_id: Optional[str] = None,
+        can_seek: bool = True,
+        range_supported: bool = True
     ) -> Dict[str, Any]:
         if is_google_cdn(upstream_url):
             raw_ct = content_type
@@ -148,6 +150,8 @@ class MountManager:
             "formatted_size": formatted_size,
             "probing": probing,
             "probe_id": probe_id,
+            "can_seek": can_seek,
+            "range_supported": range_supported,
             "created_at": time.time(),
             "last_accessed": time.time()
         }
@@ -515,8 +519,10 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
                     "Cache-Control": "no-cache, no-store, must-revalidate"
                 }
             )
+        can_seek = mount.get("can_seek", mount.get("range_supported", True))
+        accept_ranges = "none" if (is_google_cdn(upstream_url) and not can_seek) else "bytes"
         headers = {
-            "Accept-Ranges": "bytes",
+            "Accept-Ranges": accept_ranges,
             "Content-Type": content_type,
             "Last-Modified": format_http_date(mount.get("created_at", time.time())),
             "Access-Control-Allow-Origin": "*",
@@ -525,6 +531,8 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
         }
         if total_bytes > 0:
             headers["Content-Length"] = str(total_bytes)
+        # RFC 9110: Ensure Content-Range is never emitted on 200 OK
+        headers.pop("Content-Range", None)
         return Response(status_code=200, headers=headers)
 
     # 5. GET Method (with 302 Redirect Bypass & Range Proxy Fallback)
@@ -550,12 +558,19 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
             )
 
         range_header = request.headers.get("Range")
-        return await stream_range_proxy(
+        resp = await stream_range_proxy(
             upstream_url=upstream_url,
             range_header=range_header,
             total_size=total_bytes,
             content_type=content_type
         )
+        can_seek = mount.get("can_seek", mount.get("range_supported", True))
+        if is_google_cdn(upstream_url) and not can_seek:
+            resp.headers["Accept-Ranges"] = "none"
+        # RFC 9110: Ensure Content-Range is never emitted if status is 200 OK
+        if resp.status_code == 200 and "Content-Range" in resp.headers:
+            del resp.headers["Content-Range"]
+        return resp
 
     # 6. DELETE Method (RFC 4918 File Unmounting)
     if method == "DELETE":

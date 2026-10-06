@@ -258,6 +258,9 @@ async def stream_range_proxy(
     elif content_length is not None:
         response_headers["Content-Length"] = str(content_length)
 
+    if status_code == 200 and "Content-Range" in response_headers:
+        del response_headers["Content-Range"]
+
     # Detect Google CDN or Turbo pre-buffering requirement
     is_turbo = is_google_cdn_or_turbo(upstream_url, custom_headers=custom_headers, turbo=turbo)
     if is_turbo:

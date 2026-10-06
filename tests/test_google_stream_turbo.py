@@ -227,16 +227,65 @@ def test_webdav_head_google_cdn_returns_200_and_mp4():
         assert resp_head.headers.get("Cache-Control") == "no-cache, no-store, must-revalidate"
         assert "location" not in resp_head.headers
 
-        # 2. Raw octet-stream MIME auto-correction for Google CDN
+        # 2. Raw octet-stream MIME auto-correction for Google CDN (.mp4 file)
         resp_head_raw = client.head(f"/dav/{raw_filename}")
         assert resp_head_raw.status_code == 200
         assert resp_head_raw.headers.get("Content-Type") == "video/mp4", (
-            "Google CDN streams must infer video/mp4 over octet-stream"
+            "Google CDN streams must infer video/mp4 over octet-stream for .mp4"
         )
         assert resp_head_raw.headers.get("Accept-Ranges") == "bytes"
+
+        # 3. MKV file on Google CDN must preserve video/x-matroska
+        mkv_filename = "Google_Stream_Clip.mkv"
+        mount_manager.add_mount(
+            movie_id="test_google_head_mkv",
+            filename=mkv_filename,
+            upstream_url=GOOGLE_CDN_SAMPLE_URL,
+            total_bytes=total_bytes,
+            content_type="video/x-matroska",
+            formatted_size="50.0 MB"
+        )
+        resp_head_mkv = client.head(f"/dav/{mkv_filename}")
+        assert resp_head_mkv.status_code == 200
+        assert resp_head_mkv.headers["Content-Type"] == "video/x-matroska"
+        assert "Content-Range" not in resp_head_mkv.headers
+
+        # 4. Raw octet-stream MIME auto-correction for .mkv Google CDN stream
+        raw_mkv_filename = "Raw_Google_Stream.mkv"
+        mount_manager.add_mount(
+            movie_id="test_google_head_raw_mkv",
+            filename=raw_mkv_filename,
+            upstream_url=GOOGLE_VIDEO_SAMPLE_URL,
+            total_bytes=total_bytes,
+            content_type="application/octet-stream",
+            formatted_size="50.0 MB"
+        )
+        resp_head_raw_mkv = client.head(f"/dav/{raw_mkv_filename}")
+        assert resp_head_raw_mkv.status_code == 200
+        assert resp_head_raw_mkv.headers["Content-Type"] == "video/x-matroska"
+        assert "Content-Range" not in resp_head_raw_mkv.headers
+
+        # 5. Google CDN URL that cannot seek must advertise Accept-Ranges: none
+        noseek_filename = "Google_Stream_NoSeek.mkv"
+        mount_manager.add_mount(
+            movie_id="test_google_head_noseek",
+            filename=noseek_filename,
+            upstream_url=GOOGLE_CDN_SAMPLE_URL,
+            total_bytes=total_bytes,
+            content_type="video/x-matroska",
+            formatted_size="50.0 MB",
+            can_seek=False
+        )
+        resp_head_noseek = client.head(f"/dav/{noseek_filename}")
+        assert resp_head_noseek.status_code == 200
+        assert resp_head_noseek.headers.get("Accept-Ranges") == "none"
+        assert "Content-Range" not in resp_head_noseek.headers
     finally:
         mount_manager.remove_mount(filename)
         mount_manager.remove_mount(raw_filename)
+        mount_manager.remove_mount("Google_Stream_Clip.mkv")
+        mount_manager.remove_mount("Raw_Google_Stream.mkv")
+        mount_manager.remove_mount("Google_Stream_NoSeek.mkv")
 
 
 # =============================================================================
