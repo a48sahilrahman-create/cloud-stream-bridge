@@ -40,6 +40,48 @@ def clean_relative_path(path_or_url: str) -> str:
         str_val = "/" + str_val
     return str_val
 
+
+def is_google_cdn(url_str: str) -> bool:
+    """
+    Check if upstream URL belongs to Google CDN, Google Drive, or Google Photos hosts.
+    Domains: googleusercontent.com, googlevideo.com, drive.google.com, photos.google.com
+    """
+    if not url_str:
+        return False
+    u = str(url_str).lower()
+    return any(domain in u for domain in (
+        "googleusercontent.com",
+        "googlevideo.com",
+        "drive.google.com",
+        "photos.google.com"
+    ))
+
+
+def infer_video_type(filename: str, current_type: Optional[str] = None) -> str:
+    """
+    Infer video MIME type from filename extension, defaulting to video/mp4 for Google CDN streams.
+    """
+    ext = os.path.splitext(filename or "")[1].lower()
+    ext_map = {
+        ".mp4": "video/mp4",
+        ".m4v": "video/mp4",
+        ".mkv": "video/x-matroska",
+        ".webm": "video/webm",
+        ".avi": "video/x-msvideo",
+        ".mov": "video/quicktime",
+        ".ts": "video/mp2t",
+        ".flv": "video/x-flv",
+        ".wmv": "video/x-ms-wmv",
+        ".asf": "video/x-ms-asf",
+        ".ogv": "video/ogg",
+        ".3gp": "video/3gpp"
+    }
+    if ext in ext_map:
+        return ext_map[ext]
+    if current_type and current_type.startswith("video/") and current_type not in ("video/octet-stream", "video/x-matroska"):
+        return current_type
+    return "video/mp4"
+
 # Mount registry store
 MOUNTS_DB_PATH = os.environ.get("MOUNTS_DB_PATH", os.path.join(os.path.dirname(__file__), "mounts.json"))
 
@@ -87,6 +129,15 @@ class MountManager:
         probing: bool = False,
         probe_id: Optional[str] = None
     ) -> Dict[str, Any]:
+        if is_google_cdn(upstream_url):
+            raw_ct = content_type
+            if not raw_ct or raw_ct.lower() in ("application/octet-stream", "application/x-octet-stream", "binary/octet-stream", "unknown"):
+                content_type = infer_video_type(filename)
+            elif not raw_ct.lower().startswith("video/"):
+                content_type = infer_video_type(filename)
+            elif raw_ct == "video/x-matroska" and not filename.lower().endswith((".mkv", ".webm")):
+                content_type = infer_video_type(filename)
+
         mount_data = {
             "id": movie_id,
             "filename": filename,
@@ -176,6 +227,15 @@ def _build_file_propstat(mount: Dict[str, Any], base_path: str) -> list:
     safe_filename = xml_escape(filename)
     total_bytes = mount.get("total_bytes", 0)
     content_type = mount.get("content_type", "video/x-matroska")
+    upstream_url = mount.get("upstream_url", "")
+    if is_google_cdn(upstream_url):
+        raw_ct = mount.get("content_type")
+        if not raw_ct or raw_ct.lower() in ("application/octet-stream", "application/x-octet-stream", "binary/octet-stream", "unknown"):
+            content_type = infer_video_type(filename)
+        elif not raw_ct.lower().startswith("video/"):
+            content_type = infer_video_type(filename)
+        elif raw_ct == "video/x-matroska" and not filename.lower().endswith((".mkv", ".webm")):
+            content_type = infer_video_type(filename)
     created_at = mount.get("created_at", time.time())
     mod_date = format_http_date(created_at)
     iso_creation_date = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(created_at))
@@ -432,9 +492,18 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
     upstream_url = mount.get("upstream_url", "")
     mount["last_accessed"] = time.time()
 
+    if is_google_cdn(upstream_url):
+        raw_ct = mount.get("content_type")
+        if not raw_ct or raw_ct.lower() in ("application/octet-stream", "application/x-octet-stream", "binary/octet-stream", "unknown"):
+            content_type = infer_video_type(filename)
+        elif not raw_ct.lower().startswith("video/"):
+            content_type = infer_video_type(filename)
+        elif raw_ct == "video/x-matroska" and not filename.lower().endswith((".mkv", ".webm")):
+            content_type = infer_video_type(filename)
+
     # 4. HEAD Method
     if method == "HEAD":
-        if request.query_params.get("redirect") == "1" and upstream_url:
+        if not is_google_cdn(upstream_url) and request.query_params.get("redirect") == "1" and upstream_url:
             return RedirectResponse(
                 url=upstream_url,
                 status_code=302,
@@ -463,6 +532,7 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
         force_proxy = (
             request.query_params.get("proxy") == "1"
             or os.environ.get("WEBDAV_DIRECT_REDIRECT") == "0"
+            or is_google_cdn(upstream_url)
         )
         if not force_proxy and upstream_url:
             return RedirectResponse(

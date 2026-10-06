@@ -26,6 +26,82 @@ VIDEO_EXTENSIONS = (
 probe_tracker: Dict[str, Dict[str, Any]] = {}
 probe_events: Dict[str, asyncio.Event] = {}
 warmed_tails: set = set()
+warmed_heads: set = set()
+
+# Google CDN Video Detection & Synthetic Safe Floor Configurations
+GOOGLE_CDN_DOMAINS = (
+    "googlevideo.com",
+    "googleusercontent.com",
+    "gvt1.com",
+    "1e100.net",
+    "video.google.com",
+    "drive.google.com",
+    "docs.google.com",
+)
+GOOGLE_CDN_SYNTHETIC_FLOOR_BYTES = 50 * (1024 ** 3)  # 50 GiB = 53,687,091,200 bytes
+
+
+def is_google_cdn_url(url: Optional[str]) -> bool:
+    """Check if URL belongs to Google CDN / Google Video streaming infrastructure."""
+    if not url:
+        return False
+    u_lower = url.lower()
+    if any(domain in u_lower for domain in GOOGLE_CDN_DOMAINS):
+        return True
+    if "videoplayback" in u_lower or "googlevideo" in u_lower:
+        return True
+    return False
+
+
+async def warm_stream_head(
+    url: str,
+    custom_headers: Optional[Dict[str, str]] = None
+) -> bool:
+    """
+    Async background task to warm the head 64KB (bytes=0-65535)
+    so container headers and initial atoms are warmed in origin storage cache.
+    """
+    if not url:
+        return False
+
+    cache_key = f"head:{url}"
+    if cache_key in warmed_heads:
+        return True
+    warmed_heads.add(cache_key)
+
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if (parsed.scheme and parsed.netloc) else ""
+
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "*/*",
+        "Range": "bytes=0-65535",
+    }
+    if origin:
+        headers["Referer"] = f"{origin}/"
+        headers["Origin"] = origin
+    if custom_headers:
+        headers.update(custom_headers)
+
+    client_kwargs = {
+        "timeout": PROBE_TIMEOUT,
+        "follow_redirects": True,
+        "verify": False
+    }
+
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code in (200, 206):
+                    async for _ in resp.aiter_bytes():
+                        pass
+                    return True
+                else:
+                    warmed_heads.discard(cache_key)
+    except Exception:
+        warmed_heads.discard(cache_key)
+    return False
+
 
 async def warm_mkv_tail(
     url: str,
@@ -79,6 +155,85 @@ async def warm_mkv_tail(
     except Exception:
         warmed_tails.discard(cache_key)
     return False
+
+
+async def warm_mp4_moov_tail(
+    url: str,
+    total_bytes: int,
+    custom_headers: Optional[Dict[str, str]] = None
+) -> bool:
+    """
+    Async background task to warm the tail 2MB (bytes=(total_bytes - 2097152)-(total_bytes - 1))
+    for MP4 files or Google CDN video URLs so moov atom is warmed in origin storage cache.
+    """
+    if total_bytes <= 2097152 or not url:
+        return False
+
+    cache_key = f"mp4:{url}:{total_bytes}"
+    legacy_key = f"{url}:{total_bytes}"
+    if cache_key in warmed_tails or legacy_key in warmed_tails:
+        return True
+    warmed_tails.add(cache_key)
+    warmed_tails.add(legacy_key)
+
+    tail_start = total_bytes - 2097152
+    tail_end = total_bytes - 1
+
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if (parsed.scheme and parsed.netloc) else ""
+
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "*/*",
+        "Range": f"bytes={tail_start}-{tail_end}",
+    }
+    if origin:
+        headers["Referer"] = f"{origin}/"
+        headers["Origin"] = origin
+    if custom_headers:
+        headers.update(custom_headers)
+
+    client_kwargs = {
+        "timeout": PROBE_TIMEOUT,
+        "follow_redirects": True,
+        "verify": False
+    }
+
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code in (200, 206):
+                    async for _ in resp.aiter_bytes():
+                        pass
+                    return True
+                else:
+                    warmed_tails.discard(cache_key)
+                    warmed_tails.discard(legacy_key)
+    except Exception:
+        warmed_tails.discard(cache_key)
+        warmed_tails.discard(legacy_key)
+    return False
+
+
+async def warm_container_tail(
+    url: str,
+    total_bytes: int,
+    container_type: str = "auto",
+    custom_headers: Optional[Dict[str, str]] = None
+) -> bool:
+    """
+    Unified container tail warmer:
+    Pre-warms tail 64KB for MKV (Cues) or tail 2MB for MP4 / Google CDN (moov atom).
+    """
+    ct = (container_type or "auto").lower()
+    if ct == "auto":
+        if is_google_cdn_url(url) or (url and ".mp4" in url.lower()):
+            ct = "mp4"
+        else:
+            ct = "mkv"
+    if any(k in ct for k in ("mp4", "google", "isobmff")):
+        return await warm_mp4_moov_tail(url, total_bytes, custom_headers)
+    return await warm_mkv_tail(url, total_bytes, custom_headers)
 
 def get_probe_event(key: str) -> asyncio.Event:
     """Return or create an asyncio.Event for a given probe_id or filename."""
@@ -420,12 +575,24 @@ async def probe_stream(
             except ValueError:
                 pass
 
-        set_probe_stage(probe_id, "size_lock", 85, "Locking Byte-Range & File Size", {"total_bytes": total_bytes})
+        # Google CDN Resilience & Synthetic Safe Floor (e.g. unauthenticated HTTP 400 or zero-byte response)
+        is_google_cdn = is_google_cdn_url(url) or is_google_cdn_url(final_url)
+        synthetic_floor_applied = False
+        if is_google_cdn and (status_code == 400 or (status_code not in (200, 206)) or total_bytes <= 0):
+            total_bytes = GOOGLE_CDN_SYNTHETIC_FLOOR_BYTES
+            synthetic_floor_applied = True
+            range_supported = True
+            error_msg = None
+            status_code = 200
+
+        set_probe_stage(probe_id, "size_lock", 85,
+                        "Locking Byte-Range & File Size (Google CDN Safe Floor)" if synthetic_floor_applied else "Locking Byte-Range & File Size",
+                        {"total_bytes": total_bytes})
 
         # Optimistic streaming capability:
         # If total_bytes == 0 or range is not explicitly advertised, mark range_supported = True
         # because many modern CDNs support range requests even if Accept-Ranges header is omitted.
-        if (status_code == 206) or ("bytes" in accept_ranges) or (total_bytes == 0) or (accept_ranges != "none"):
+        if synthetic_floor_applied or (status_code == 206) or ("bytes" in accept_ranges) or (total_bytes == 0) or (accept_ranges != "none"):
             range_supported = True
         else:
             range_supported = False
@@ -455,6 +622,10 @@ async def probe_stream(
             ext = ".mkv"
         elif is_mp4:
             container_format = "MP4 (ISOBMFF / H.264 / HEVC)"
+            mime = "video/mp4"
+            ext = ".mp4"
+        elif is_google_cdn and synthetic_floor_applied:
+            container_format = "MP4 Video Stream (Google CDN)"
             mime = "video/mp4"
             ext = ".mp4"
         elif is_ts:
@@ -498,25 +669,45 @@ async def probe_stream(
         url_filename = extract_filename(final_url, resp_headers, ext=ext, fallback_url=url)
 
         is_valid = (status_code in [200, 206])
-        set_probe_stage(probe_id, "ready", 100, "Ready for CX File Explorer", {
+        ready_label = "Ready for CX File Explorer (Google CDN Safe Floor)" if synthetic_floor_applied else "Ready for CX File Explorer"
+        ready_stage_data = {
             "total_bytes": total_bytes,
             "formatted_size": formatted_size,
             "container_format": container_format,
             "filename": url_filename,
             "done": True,
             "valid": is_valid
-        })
+        }
+        if synthetic_floor_applied:
+            ready_stage_data["synthetic_floor"] = True
+
+        set_probe_stage(probe_id, "ready", 100, ready_label, ready_stage_data)
         if evt:
             evt.set()
 
-        # Warm tail 64KB (Cues index) for MKV containers in background
-        if is_valid and (is_mkv or ext == ".mkv" or mime == "video/x-matroska") and total_bytes > 65536:
-            try:
-                asyncio.create_task(warm_mkv_tail(final_url or url, total_bytes, custom_headers))
-            except Exception:
-                pass
+        # Background warming of container metadata:
+        # MKV: tail 64KB (Cues index)
+        # MP4 / Google CDN: head 64KB + tail 2MB (moov atom)
+        if is_valid:
+            target_url = final_url or url
+            is_mp4_or_google = is_mp4 or (ext == ".mp4") or (mime == "video/mp4") or is_google_cdn
+            if is_mp4_or_google:
+                try:
+                    asyncio.create_task(warm_stream_head(target_url, custom_headers))
+                except Exception:
+                    pass
+                if total_bytes > 2097152:
+                    try:
+                        asyncio.create_task(warm_mp4_moov_tail(target_url, total_bytes, custom_headers))
+                    except Exception:
+                        pass
+            elif (is_mkv or ext == ".mkv" or mime == "video/x-matroska") and total_bytes > 65536:
+                try:
+                    asyncio.create_task(warm_mkv_tail(target_url, total_bytes, custom_headers))
+                except Exception:
+                    pass
 
-        return {
+        return_dict = {
             "valid": is_valid,
             "status_code": status_code,
             "range_supported": range_supported,
@@ -529,9 +720,52 @@ async def probe_stream(
             "elapsed_ms": elapsed_ms,
             "error": None if is_valid else (error_msg or f"HTTP {status_code} received from upstream server")
         }
+        if synthetic_floor_applied:
+            return_dict["synthetic_floor"] = True
+
+        return return_dict
 
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        target_final = final_url or url
+        if is_google_cdn_url(url) or is_google_cdn_url(target_final):
+            syn_bytes = GOOGLE_CDN_SYNTHETIC_FLOOR_BYTES
+            syn_fn = extract_filename(target_final, ext=".mp4", fallback_url=url)
+            set_probe_stage(probe_id, "ready", 100, "Ready for CX File Explorer (Google CDN Fallback Floor)", {
+                "total_bytes": syn_bytes,
+                "formatted_size": "50.0 GB",
+                "container_format": "MP4 Video Stream (Google CDN)",
+                "filename": syn_fn,
+                "done": True,
+                "valid": True,
+                "error": None,
+                "synthetic_floor": True
+            })
+            if evt:
+                evt.set()
+            try:
+                asyncio.create_task(warm_stream_head(target_final, custom_headers))
+            except Exception:
+                pass
+            try:
+                asyncio.create_task(warm_mp4_moov_tail(target_final, syn_bytes, custom_headers))
+            except Exception:
+                pass
+            return {
+                "valid": True,
+                "status_code": 200,
+                "range_supported": True,
+                "container_format": "MP4 Video Stream (Google CDN)",
+                "content_type": "video/mp4",
+                "total_bytes": syn_bytes,
+                "formatted_size": "50.0 GB",
+                "default_filename": syn_fn,
+                "final_url": target_final,
+                "elapsed_ms": elapsed_ms,
+                "error": None,
+                "synthetic_floor": True
+            }
+
         set_probe_stage(probe_id, "ready", 100, "Ready in Fallback Mode", {
             "total_bytes": 0,
             "formatted_size": "Dynamic Stream",
@@ -550,7 +784,7 @@ async def probe_stream(
             "total_bytes": 0,
             "formatted_size": "Dynamic Stream",
             "default_filename": extract_filename(url, ext=".mkv"),
-            "final_url": final_url or url,
+            "final_url": target_final,
             "elapsed_ms": elapsed_ms,
             "error": str(e)
         }

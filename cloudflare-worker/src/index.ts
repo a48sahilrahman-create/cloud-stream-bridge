@@ -94,6 +94,46 @@ function inferContentType(filename: string): string {
 }
 
 /**
+ * Detect if upstream URL belongs to Google CDN / Drive / Photos / YouTube ecosystems
+ * where direct client 302 redirects fail due to IP-binding, ephemeral auth tokens,
+ * or aggressive bot-checks, requiring Worker edge-proxying.
+ */
+export function isGoogleCdn(urlStr: string): boolean {
+  if (!urlStr || typeof urlStr !== "string") {
+    return false;
+  }
+  try {
+    const parsed = new URL(urlStr);
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === "video-downloads.googleusercontent.com" ||
+      host === "googleusercontent.com" ||
+      host.endsWith(".googleusercontent.com") ||
+      host === "drive.google.com" ||
+      host.endsWith(".drive.google.com") ||
+      host === "photos.google.com" ||
+      host.endsWith(".photos.google.com") ||
+      host === "googlevideo.com" ||
+      host.endsWith(".googlevideo.com")
+    ) {
+      return true;
+    }
+  } catch {
+    const lower = urlStr.toLowerCase();
+    if (
+      lower.includes("video-downloads.googleusercontent.com") ||
+      lower.includes("googleusercontent.com") ||
+      lower.includes("drive.google.com") ||
+      lower.includes("photos.google.com") ||
+      lower.includes("googlevideo.com")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Tier 2 Edge Fallback Range Probe (0-8191 with 4s timeout) or 100 GiB synthetic floor
  */
 async function probeStream(
@@ -819,7 +859,9 @@ export default {
         const mount = await findMount(env, userId, decodedTargetFilename);
         if (mount) {
           const totalBytes = mount.size_bytes > 0 ? mount.size_bytes : SYNTHETIC_FLOOR_BYTES;
-          const contentType = mount.content_type || inferContentType(mount.filename);
+          const contentType = isGoogleCdn(mount.upstream_url)
+            ? "video/mp4"
+            : (mount.content_type || inferContentType(mount.filename));
           return new Response(null, {
             status: 200,
             statusText: "OK",
@@ -829,6 +871,32 @@ export default {
               "Content-Length": totalBytes.toString(),
               "Last-Modified": formatWebDavDate(mount.created_at || Date.now()),
               ETag: mount.etag || `W/"${mount.id}-${totalBytes}"`,
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Expose-Headers":
+                "Location, Content-Range, Accept-Ranges, Content-Length, Content-Type, DAV",
+              "Cache-Control": "no-cache, no-store, must-revalidate",
+              DAV: "1, 2",
+              "MS-Author-Via": "DAV",
+              ...getCorsHeaders(),
+            },
+          });
+        }
+
+        // Never redirect HEAD for Google CDN URLs; return synthetic 200 OK
+        if (
+          isGoogleCdn(decodedTargetFilename) ||
+          isGoogleCdn(cleanPath) ||
+          isGoogleCdn(url.searchParams.get("url") || "")
+        ) {
+          return new Response(null, {
+            status: 200,
+            statusText: "OK",
+            headers: {
+              "Accept-Ranges": "bytes",
+              "Content-Type": "video/mp4",
+              "Content-Length": SYNTHETIC_FLOOR_BYTES.toString(),
+              "Last-Modified": formatWebDavDate(),
+              ETag: `W/"google-cdn-${SYNTHETIC_FLOOR_BYTES}"`,
               "Access-Control-Allow-Origin": "*",
               "Access-Control-Expose-Headers":
                 "Location, Content-Range, Accept-Ranges, Content-Length, Content-Type, DAV",
@@ -852,7 +920,8 @@ export default {
           const forceProxy =
             url.searchParams.get("proxy") === "1" ||
             url.searchParams.get("proxy") === "true" ||
-            request.headers.get("X-Stream-Mode") === "proxy";
+            request.headers.get("X-Stream-Mode") === "proxy" ||
+            isGoogleCdn(mount.upstream_url);
 
           if (!forceProxy) {
             // Default: Direct 302 CDN redirection for full wire speed streaming
@@ -910,11 +979,25 @@ export default {
             responseHeaders.set("DAV", "1, 2");
             responseHeaders.set("MS-Author-Via", "DAV");
 
-            const upstreamContentType = upstreamResp.headers.get("Content-Type");
-            responseHeaders.set(
-              "Content-Type",
-              mount.content_type || upstreamContentType || inferContentType(mount.filename)
-            );
+            const upstreamContentType = upstreamResp.headers.get("Content-Type") || "";
+            const isInvalidType = (ct?: string | null): boolean =>
+              !ct ||
+              ct.toLowerCase().includes("application/octet-stream") ||
+              ct.toLowerCase().includes("text/html");
+
+            let effectiveContentType = "";
+            if (mount.content_type && !isInvalidType(mount.content_type)) {
+              effectiveContentType = mount.content_type;
+            } else if (upstreamContentType && !isInvalidType(upstreamContentType)) {
+              effectiveContentType = upstreamContentType;
+            } else {
+              effectiveContentType = inferContentType(mount.filename);
+            }
+            if (isInvalidType(effectiveContentType)) {
+              effectiveContentType = "video/mp4";
+            }
+
+            responseHeaders.set("Content-Type", effectiveContentType);
 
             const upstreamContentRange = upstreamResp.headers.get("Content-Range");
             if (upstreamContentRange) {
@@ -1024,7 +1107,36 @@ export default {
         : "";
 
       // Tunnel GET / HEAD: HTTP 302 Found redirect (0 bytes video proxying)
-      if (method === "GET" || method === "HEAD") {
+      if (method === "HEAD") {
+        if (
+          isGoogleCdn(tunnelUrl) ||
+          isGoogleCdn(cleanPath) ||
+          isGoogleCdn(decodedTargetFilename) ||
+          isGoogleCdn(url.searchParams.get("url") || "")
+        ) {
+          return new Response(null, {
+            status: 200,
+            statusText: "OK",
+            headers: {
+              "Accept-Ranges": "bytes",
+              "Content-Type": "video/mp4",
+              "Content-Length": SYNTHETIC_FLOOR_BYTES.toString(),
+              "Last-Modified": formatWebDavDate(),
+              ETag: `W/"google-cdn-${SYNTHETIC_FLOOR_BYTES}"`,
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Expose-Headers":
+                "Location, Content-Range, Accept-Ranges, Content-Length, Content-Type, DAV",
+              "Cache-Control": "no-cache, no-store, must-revalidate",
+              DAV: "1, 2",
+              "MS-Author-Via": "DAV",
+              ...getCorsHeaders(),
+            },
+          });
+        }
+        return makeRedirectResponse(tunnelUrl, encodedPath, url.search);
+      }
+
+      if (method === "GET") {
         return makeRedirectResponse(tunnelUrl, encodedPath, url.search);
       }
 
@@ -1046,7 +1158,36 @@ export default {
         tunnelCache.delete(userId);
         const newTunnelUrl = await getActiveTunnel(hubUrl, userId, true);
         if (newTunnelUrl && newTunnelUrl !== tunnelUrl) {
-          if (method === "GET" || method === "HEAD") {
+          if (method === "HEAD") {
+            if (
+              isGoogleCdn(newTunnelUrl) ||
+              isGoogleCdn(cleanPath) ||
+              isGoogleCdn(decodedTargetFilename) ||
+              isGoogleCdn(url.searchParams.get("url") || "")
+            ) {
+              return new Response(null, {
+                status: 200,
+                statusText: "OK",
+                headers: {
+                  "Accept-Ranges": "bytes",
+                  "Content-Type": "video/mp4",
+                  "Content-Length": SYNTHETIC_FLOOR_BYTES.toString(),
+                  "Last-Modified": formatWebDavDate(),
+                  ETag: `W/"google-cdn-${SYNTHETIC_FLOOR_BYTES}"`,
+                  "Access-Control-Allow-Origin": "*",
+                  "Access-Control-Expose-Headers":
+                    "Location, Content-Range, Accept-Ranges, Content-Length, Content-Type, DAV",
+                  "Cache-Control": "no-cache, no-store, must-revalidate",
+                  DAV: "1, 2",
+                  "MS-Author-Via": "DAV",
+                  ...getCorsHeaders(),
+                },
+              });
+            }
+            return makeRedirectResponse(newTunnelUrl, encodedPath, url.search);
+          }
+
+          if (method === "GET") {
             return makeRedirectResponse(newTunnelUrl, encodedPath, url.search);
           }
 

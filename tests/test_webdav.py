@@ -692,6 +692,74 @@ async def test_warm_mkv_tail():
         assert captured_headers.get("Range") == "bytes=34464-99999"
 
 
+@pytest.mark.asyncio
+async def test_google_cdn_handling():
+    from webdav_engine import is_google_cdn, infer_video_type
+    from unittest.mock import patch, AsyncMock
+    from starlette.responses import Response
+
+    # 1. Verify is_google_cdn helper on target domains
+    assert is_google_cdn("https://lh3.googleusercontent.com/d/12345") is True
+    assert is_google_cdn("https://rr1---sn-4g5ednks.googlevideo.com/videoplayback?id=123") is True
+    assert is_google_cdn("https://drive.google.com/uc?id=abc&export=download") is True
+    assert is_google_cdn("https://photos.google.com/direct/video.mp4") is True
+    assert is_google_cdn("https://pub-abc.r2.dev/stream.mkv") is False
+    assert is_google_cdn("https://example.com/video.mp4") is False
+    assert is_google_cdn("") is False
+    assert is_google_cdn(None) is False
+
+    # 2. Verify infer_video_type
+    assert infer_video_type("movie.mp4", "application/octet-stream") == "video/mp4"
+    assert infer_video_type("movie.mkv", "application/octet-stream") == "video/x-matroska"
+    assert infer_video_type("stream_no_ext", "application/octet-stream") == "video/mp4"
+    assert infer_video_type("stream_no_ext", None) == "video/mp4"
+    assert infer_video_type("stream_no_ext", "") == "video/mp4"
+
+    # 3. Mount Google Drive video with application/octet-stream content_type
+    g_url = "https://drive.google.com/uc?id=google_cdn_test_123&export=download"
+    mount_manager.add_mount(
+        movie_id="g_test_1",
+        filename="GoogleDriveVideo.mp4",
+        upstream_url=g_url,
+        total_bytes=10485760,
+        content_type="application/octet-stream",
+        formatted_size="10 MB"
+    )
+
+    try:
+        # 4. HEAD request with ?redirect=1 must bypass redirect and return 200 OK
+        resp_head_redir = client.head("/dav/GoogleDriveVideo.mp4?redirect=1")
+        assert resp_head_redir.status_code == 200
+        assert resp_head_redir.headers.get("Accept-Ranges") == "bytes"
+        assert resp_head_redir.headers.get("Content-Type") == "video/mp4"
+        assert resp_head_redir.headers.get("Content-Length") == "10485760"
+
+        # 5. Standard HEAD request also returns 200 OK with video/mp4
+        resp_head = client.head("/dav/GoogleDriveVideo.mp4")
+        assert resp_head.status_code == 200
+        assert resp_head.headers.get("Accept-Ranges") == "bytes"
+        assert resp_head.headers.get("Content-Type") == "video/mp4"
+
+        # 6. GET request must NOT return 302 redirect for Google CDN streams; must invoke stream_range_proxy
+        async def mock_proxy(upstream_url, range_header, total_size, content_type):
+            return Response(
+                content=b"video_bytes",
+                status_code=206 if range_header else 200,
+                headers={"Content-Type": content_type}
+            )
+
+        with patch("webdav_engine.stream_range_proxy", side_effect=mock_proxy) as mock_srp:
+            resp_get = client.get("/dav/GoogleDriveVideo.mp4", headers={"Range": "bytes=0-1023"})
+            assert resp_get.status_code != 302
+            assert mock_srp.called
+            call_kwargs = mock_srp.call_args.kwargs
+            assert call_kwargs["upstream_url"] == g_url
+            assert call_kwargs["content_type"] == "video/mp4"
+
+    finally:
+        mount_manager.remove_mount("GoogleDriveVideo.mp4")
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

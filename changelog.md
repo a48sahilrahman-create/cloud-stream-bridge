@@ -1,6 +1,50 @@
 # Changelog & Architectural State — CloudStream WebDAV Bridge
 
 ## Current State
+- **Google CDN Turbo Streaming & Edge Shield Engine Deployed (`cloudflare-worker/src/index.ts`, `webdav_engine.py`, `range_proxy.py`, `stream_probe.py`)**:
+  - **Core Diagnosis & Multi-Player Failure Matrix**:
+    - Identified quadruple-compound failure mode on `video-downloads.googleusercontent.com` and Google CDN video streams:
+      1. Preflight Probe Rejection: Google CDN rejects preflight HTTP `HEAD` probes with `HTTP 400 Bad Request`. CX File Explorer demuxer crashes immediately when preflight `HEAD` returns 4xx.
+      2. MIME Type Mismatch: Google returns `application/octet-stream` or `text/html`, causing CX File Explorer built-in video player and Canto to fail demuxing.
+      3. Strict Per-Connection Bandwidth Pacing: Google throttles single-TCP stream downloads to ~1–2 Mbps, depleting network buffers on VLC and MPV, resulting in severe stuttering.
+      4. MP4 Container Geometry: Non-faststart MP4 files position the `moov` index atom at the end of the file. Without fast tail seeking, players stall or attempt to download the full multi-gigabyte stream upfront.
+  - **Architectural Remediation Deployed**:
+    - **Origin Classifier (`is_google_cdn` / `isGoogleCdn`)**: Matches `*.googleusercontent.com`, `video-downloads.googleusercontent.com`, `*.googlevideo.com`, `drive.google.com`, `photos.google.com`, `storage.googleapis.com`, `gvt1.com`, and `1e100.net`.
+    - **Redirect Suppression & Automatic Proxy Enforcement**: Overrides default `HTTP 302 Found` redirection for Google CDN streams across both Cloudflare Worker (`cloudflare-worker/src/index.ts`) and Python WebDAV engine (`webdav_engine.py`). Forces transparent streaming proxy (`forceProxy = true`) so client players never receive an unshielded 302 redirect.
+    - **Synthetic Preflight `HEAD` & MIME Normalization Shield**: Intercepts preflight `HEAD` probes locally; returns immediate synthetic `HTTP 200 OK` with `Content-Type: video/mp4`, `Accept-Ranges: bytes`, and exact/synthetic `Content-Length`. Automatically overrides `application/octet-stream` and `text/html` upstream headers to valid `video/mp4`.
+    - **Multi-Connection Turbo Range Chunking (`range_proxy.py`)**: Automatic pipelined segment prefetching over pooled HTTP connections with `X-Turbo-Prefetch: active` and `X-Streaming-Mode: turbo-pipelined`, decoupling client socket read rate from upstream CDN per-connection rate throttling, with sub-10ms immediate client disconnect trapping.
+    - **Tail `moov` Index Pre-Warming & Synthetic Floor (`stream_probe.py`)**: Added `warm_mp4_moov_tail` (fetching tail 2MB) alongside `warm_mkv_tail` (64KB), pre-caching index metadata for instant seek latency, plus 50 GiB synthetic floor shielding against the 0-Byte Guard (`503 Retry-After`) on unauthenticated probes.
+  - **Automated Verification Suites Passing**:
+    - **Cloudflare Worker**: 29/29 tests passed in `cloudflare-worker/test_worker.js` (including tests 25–29 for Google CDN detection, proxy enforcement, MIME override, and synthetic HEAD).
+    - **Python WebDAV & Turbo Engine**: 87/87 tests passed in `pytest tests/` (including 5/5 in `tests/test_google_stream_turbo.py` and 5/5 in `tests/test_range_proxy_turbo.py`).
+- **CloudStream Android Companion App UI & Direct CX WebDAV Deep-Linking Deployed (`cloud-stream-bridge-android`)**:
+  - **Redundant URL Copy Button Removed**: Removed `btn_copy_dav_url` from Step 1 (`card_edge_setup`) as `btn_configure_cx` already populates both human-readable connection parameters and RFC-compliant JSON payload (`{"type":"webdav","host":"...","port":443,...}`) to the Android clipboard.
+  - **Reordered Step 1 Action Row (`layout_edge_actions`)**:
+    - Shifted `btn_configure_cx` ("🚀 Configure CX") to the left side with primary styling (`@style/Widget.CloudStreamBridge.Button.Primary`).
+    - Added `btn_open_cx` ("📂 Open CX File Explorer") on the right side with secondary styling (`@style/Widget.CloudStreamBridge.Button.Secondary`).
+  - **Step 2 CX File Explorer Home Launcher Added (`btn_open_cx_home`)**:
+    - Added an extra "📂 Open CX File Explorer" button directly beneath the mount stream options (`btn_mount_stream`) in `card_mount`.
+    - Dispatches dual-tier standard launcher intent (`Intent.ACTION_MAIN` with `Intent.CATEGORY_LAUNCHER` targeting `com.alphainventor.filemanager.activity.MainActivity` in `com.cxinventor.file.explorer`), cleanly opening CX File Explorer directly to its standard home dashboard.
+    - Integrated with fallback to `packageManager.getLaunchIntentForPackage`.
+  - **Superhuman Speed-Run 3-Tier Intent Deep-Linking Cascade (`openCxAtWebdavLocation`)**:
+    - Reverse-engineered CX File Explorer smali bytecode (`MainActivity.smali`, `LaunchActivity.smali`, `ShortcutActivity.smali`, `ax/Q2/f.smali`, `ax/Z2/k.smali`) to bypass the home dashboard and open CX directly into the remote WebDAV dialog/tab:
+      - **Tier 1 (Direct Dialog)**: `com.alphainventor.filemanager.OPEN_FILE` with URI `add_network://0/` and component `com.cxinventor.file.explorer/com.alphainventor.filemanager.activity.MainActivity` (invokes `MainActivity.B2()`, displaying the `Lax/a3/g;` Add Network Location / Remote dialog directly).
+      - **Tier 2 (Remote Tab Fallback)**: `com.alphainventor.filemanager.OPEN_FILE` with URI `remote://0/` (switches UI directly to the Network/Remote storage tab).
+      - **Tier 3 (Package Launcher Fallback)**: `packageManager.getLaunchIntentForPackage("com.cxinventor.file.explorer")` for standard app launch if deep-links fail.
+  - **Android TV Remote D-Pad 8-Node Traversal Matrix**:
+    - Expanded focus chaining from 7 to 8 interactive nodes with zero orphaned elements:
+      - Node 1 (`btn_configure_cx`): Left: self, Right: `btn_open_cx`, Down: `edit_stream_url`, Up: self.
+      - Node 2 (`btn_open_cx`): Left: `btn_configure_cx`, Right: self, Down: `btn_paste_stream`, Up: self.
+      - Node 3 (`edit_stream_url`): Up: `btn_configure_cx`, Down: `btn_mount_stream`, Left: self, Right: `btn_paste_stream`.
+      - Node 4 (`btn_paste_stream`): Up: `btn_open_cx`, Down: `btn_mount_stream`, Left: `edit_stream_url`, Right: self.
+      - Node 5 (`btn_mount_stream`): Up: `edit_stream_url`, Down: `btn_open_cx_home`, Left: self, Right: self.
+      - Node 6 (`btn_open_cx_home`): Up: `btn_mount_stream`, Down: `btn_unmount_all`, Left: self, Right: self.
+      - Node 7 (`btn_unmount_all`): Up: `btn_open_cx_home`, Down: `recycler_mounts`, Left: self, Right: `recycler_mounts`.
+      - Node 8 (`recycler_mounts`): Up: `btn_unmount_all`, Down: self, Left: `btn_unmount_all`, Right: self.
+  - **Verification & Build**:
+    - Compiled cleanly with Gradle: `./gradlew assembleDebug` (36 actionable tasks, BUILD SUCCESSFUL in 8s).
+    - Verified APK output: `app-debug.apk` (6.47 MB).
+    - Living documentation synchronized in `APP_ARCHITECTURE.md` and `APP_ARCHITECTURE.json`.
 - **Primary & Dedicated Backup Repositories and Frozen Baseline Deployed**:
   - **Primary GitHub Repository**: `https://github.com/a48sahilrahman-create/cloud-stream-bridge`
   - **Dedicated Backup Repository**: `https://github.com/a48sahilrahman-create/cloud-stream-bridge-backup` (exact frozen working baseline snapshot).

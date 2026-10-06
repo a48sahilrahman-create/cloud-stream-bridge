@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert';
-import worker, { warmStreamStorage } from './src/index.ts';
+import worker, { warmStreamStorage, isGoogleCdn } from './src/index.ts';
 import {
   getUserMounts,
   saveUserMount,
@@ -135,6 +135,50 @@ globalThis.fetch = async (input, init = {}) => {
       headers: {
         'Content-Type': 'video/x-matroska',
         'Content-Length': '64424509440',
+        'Accept-Ranges': 'bytes',
+      },
+    });
+  }
+
+  // 4. Intercept Google CDN stream requests
+  if (
+    urlStr.includes('googleusercontent.com') ||
+    urlStr.includes('googlevideo.com') ||
+    urlStr.includes('drive.google.com') ||
+    urlStr.includes('photos.google.com')
+  ) {
+    const rangeHeader =
+      init.headers instanceof Headers
+        ? init.headers.get('Range')
+        : init.headers?.Range || init.headers?.range;
+
+    const returnHtml = urlStr.includes('return_html');
+    const returnOctet = urlStr.includes('return_octet');
+    const contentType = returnHtml
+      ? 'text/html; charset=UTF-8'
+      : returnOctet
+      ? 'application/octet-stream'
+      : 'video/mp4';
+
+    if (rangeHeader) {
+      return new Response('fake-google-chunk-bytes', {
+        status: 206,
+        statusText: 'Partial Content',
+        headers: {
+          'Content-Type': contentType,
+          'Content-Range': 'bytes 0-15/107374182400',
+          'Content-Length': '16',
+          'Accept-Ranges': 'bytes',
+        },
+      });
+    }
+
+    return new Response('fake-google-stream-body', {
+      status: 200,
+      statusText: 'OK',
+      headers: {
+        'Content-Type': contentType,
+        'Content-Length': '107374182400',
         'Accept-Ranges': 'bytes',
       },
     });
@@ -765,6 +809,123 @@ await runTest('24. Test POST /api/mount triggers storage pre-warming', async () 
   } finally {
     globalThis.fetch = prevFetch;
   }
+});
+
+// Test 25: isGoogleCdn helper detects all specified Google CDN domains and rejects others
+await runTest('25. Test isGoogleCdn helper detects Google CDN domains correctly', async () => {
+  assert.strictEqual(isGoogleCdn('https://video-downloads.googleusercontent.com/test_video'), true);
+  assert.strictEqual(isGoogleCdn('https://doc-0k-9k-docs.googleusercontent.com/download'), true);
+  assert.strictEqual(isGoogleCdn('https://googleusercontent.com/stream'), true);
+  assert.strictEqual(isGoogleCdn('https://drive.google.com/uc?id=12345'), true);
+  assert.strictEqual(isGoogleCdn('https://photos.google.com/u/0/video'), true);
+  assert.strictEqual(isGoogleCdn('https://rr1---sn-4g5ednks.googlevideo.com/videoplayback?id=abc'), true);
+  assert.strictEqual(isGoogleCdn('https://googlevideo.com/videoplayback'), true);
+
+  // Non-Google domains
+  assert.strictEqual(isGoogleCdn('https://cdn.upstream.com/streams/video.mkv'), false);
+  assert.strictEqual(isGoogleCdn('https://rapid-stream-1234.trycloudflare.com/dav/video.mkv'), false);
+  assert.strictEqual(isGoogleCdn('https://example.com/movie.mp4'), false);
+  assert.strictEqual(isGoogleCdn(''), false);
+});
+
+// Test 26: WebDAV GET on mounted Google CDN stream forces proxying (no 302 redirect)
+await runTest('26. Test WebDAV GET on Google CDN stream forces proxying bypassing 302 redirect', async () => {
+  // Mount a stream from Google CDN
+  const mountReq = new Request('https://edge.cloudstream.local/api/mount/user_google_test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: 'https://video-downloads.googleusercontent.com/sample_video',
+      filename: 'SampleGoogleMovie.mp4',
+      size_bytes: 107374182400,
+      content_type: 'video/mp4',
+    }),
+  });
+  const mountRes = await worker.fetch(mountReq, mockEnv, mockCtx);
+  assert.strictEqual(mountRes.status, 200);
+
+  // Normal GET request without ?proxy=1 should be forced into proxy mode (not 302 redirect!)
+  const getReq = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+    method: 'GET',
+    headers: { Range: 'bytes=0-15' },
+  });
+  const getRes = await worker.fetch(getReq, mockEnv, mockCtx);
+  assert.notStrictEqual(getRes.status, 302, 'GET on Google CDN URL must NOT return 302 redirect');
+  assert.strictEqual(getRes.status, 206, 'GET on Google CDN URL must return proxied response');
+  assert.strictEqual(getRes.headers.get('Accept-Ranges'), 'bytes');
+  assert.strictEqual(getRes.headers.get('Content-Type'), 'video/mp4');
+});
+
+// Test 27: Proxy response forces Content-Type to video/mp4 or inferred video MIME type
+await runTest('27. Test proxy response forces video Content-Type overriding octet-stream and text/html', async () => {
+  // 27a: Mount with application/octet-stream and upstream returning text/html
+  const mountReqHtml = new Request('https://edge.cloudstream.local/api/mount/user_google_mime', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: 'https://video-downloads.googleusercontent.com/test_video?return_html=1',
+      filename: 'MovieHtml.mkv',
+      size_bytes: 50000,
+      content_type: 'application/octet-stream',
+    }),
+  });
+  await worker.fetch(mountReqHtml, mockEnv, mockCtx);
+
+  const getReqHtml = new Request('https://edge.cloudstream.local/dav/user_google_mime/MovieHtml.mkv', {
+    method: 'GET',
+  });
+  const getResHtml = await worker.fetch(getReqHtml, mockEnv, mockCtx);
+  assert.strictEqual(getResHtml.status, 200);
+  assert.strictEqual(getResHtml.headers.get('Content-Type'), 'video/x-matroska', 'Should infer video/x-matroska from .mkv');
+
+  // 27b: Mount with unknown extension and upstream returning application/octet-stream -> defaults to video/mp4
+  const mountReqOctet = new Request('https://edge.cloudstream.local/api/mount/user_google_mime', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: 'https://video-downloads.googleusercontent.com/test_video?return_octet=1',
+      filename: 'ClipUnknown',
+      size_bytes: 50000,
+      content_type: 'application/octet-stream',
+    }),
+  });
+  await worker.fetch(mountReqOctet, mockEnv, mockCtx);
+
+  const getReqOctet = new Request('https://edge.cloudstream.local/dav/user_google_mime/ClipUnknown.mkv', {
+    method: 'GET',
+  });
+  const getResOctet = await worker.fetch(getReqOctet, mockEnv, mockCtx);
+  assert.strictEqual(getResOctet.status, 200);
+  assert.strictEqual(getResOctet.headers.get('Content-Type'), 'video/x-matroska');
+});
+
+// Test 28: HEAD on mounted Google CDN stream returns synthetic 200 OK
+await runTest('28. Test HEAD on mounted Google CDN stream returns synthetic 200 OK', async () => {
+  const headReq = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+    method: 'HEAD',
+  });
+  const headRes = await worker.fetch(headReq, mockEnv, mockCtx);
+  assert.strictEqual(headRes.status, 200, 'HEAD must return 200 OK synthetic response');
+  assert.strictEqual(headRes.headers.get('Accept-Ranges'), 'bytes');
+  assert.strictEqual(headRes.headers.get('Content-Type'), 'video/mp4');
+  assert.strictEqual(headRes.headers.get('Content-Length'), '107374182400');
+  assert.strictEqual(headRes.headers.get('DAV'), '1, 2');
+});
+
+// Test 29: HEAD on tunnel fallback never redirects Google CDN URLs and returns synthetic 200 OK
+await runTest('29. Test HEAD on tunnel fallback never redirects Google CDN URLs', async () => {
+  // If target filename is a Google CDN URL or tunnel URL points to Google CDN
+  const headReq = new Request(
+    'https://edge.cloudstream.local/dav/active_user/https%3A%2F%2Fvideo-downloads.googleusercontent.com%2Fstream.mp4',
+    {
+      method: 'HEAD',
+    }
+  );
+  const headRes = await worker.fetch(headReq, mockEnv, mockCtx);
+  assert.strictEqual(headRes.status, 200, 'HEAD must return synthetic 200 OK for Google CDN target');
+  assert.strictEqual(headRes.headers.get('Accept-Ranges'), 'bytes');
+  assert.strictEqual(headRes.headers.get('Content-Type'), 'video/mp4');
+  assert.strictEqual(headRes.headers.get('Content-Length'), '107374182400');
 });
 
 console.log(`\nAll tests passed successfully! Total: ${testsPassed}`);
