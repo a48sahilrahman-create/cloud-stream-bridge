@@ -246,6 +246,87 @@ export function warmStreamStorage(
   }
 }
 
+function createRangeStream(
+  upstreamStream: ReadableStream<Uint8Array>,
+  skipBytes: number,
+  takeBytes: number // -1 for unlimited
+): ReadableStream<Uint8Array> {
+  let skipped = 0;
+  let taken = 0;
+  const reader = upstreamStream.getReader();
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (takeBytes >= 0 && taken >= takeBytes) {
+        controller.close();
+        try { await reader.cancel(); } catch (_) {}
+        return;
+      }
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done || !value) {
+          controller.close();
+          return;
+        }
+
+        if (skipped < skipBytes) {
+          const neededSkip = skipBytes - skipped;
+          if (value.byteLength <= neededSkip) {
+            skipped += value.byteLength;
+            continue;
+          } else {
+            const remaining = value.subarray(neededSkip);
+            skipped = skipBytes;
+            if (takeBytes >= 0) {
+              const neededTake = takeBytes - taken;
+              if (remaining.byteLength <= neededTake) {
+                taken += remaining.byteLength;
+                controller.enqueue(remaining);
+                if (taken >= takeBytes) {
+                  controller.close();
+                  try { await reader.cancel(); } catch (_) {}
+                }
+              } else {
+                controller.enqueue(remaining.subarray(0, neededTake));
+                taken = takeBytes;
+                controller.close();
+                try { await reader.cancel(); } catch (_) {}
+              }
+            } else {
+              controller.enqueue(remaining);
+            }
+            return;
+          }
+        }
+
+        if (takeBytes >= 0) {
+          const neededTake = takeBytes - taken;
+          if (value.byteLength <= neededTake) {
+            taken += value.byteLength;
+            controller.enqueue(value);
+            if (taken >= takeBytes) {
+              controller.close();
+              try { await reader.cancel(); } catch (_) {}
+            }
+          } else {
+            controller.enqueue(value.subarray(0, neededTake));
+            taken = takeBytes;
+            controller.close();
+            try { await reader.cancel(); } catch (_) {}
+          }
+        } else {
+          controller.enqueue(value);
+        }
+        return;
+      }
+    },
+    async cancel(reason) {
+      try { await reader.cancel(reason); } catch (_) {}
+    }
+  });
+}
+
 /**
  * Render RFC 4918 XML element for a single mounted virtual file
  */
@@ -868,7 +949,7 @@ export default {
             mount.content_type && mount.content_type !== "application/octet-stream"
               ? mount.content_type
               : inferContentType(mount.filename);
-          const acceptRanges = isGoogleCdn(mount.upstream_url) ? "none" : "bytes";
+          const acceptRanges = "bytes";
           return new Response(null, {
             status: 200,
             statusText: "OK",
@@ -977,10 +1058,7 @@ export default {
             });
 
             const responseHeaders = new Headers();
-            responseHeaders.set(
-              "Accept-Ranges",
-              isGoogleCdn(mount.upstream_url) ? "none" : "bytes"
-            );
+            responseHeaders.set("Accept-Ranges", "bytes");
             responseHeaders.set("Access-Control-Allow-Origin", "*");
             responseHeaders.set(
               "Access-Control-Expose-Headers",
@@ -1010,37 +1088,77 @@ export default {
             responseHeaders.set("Content-Type", effectiveContentType);
 
             const totalBytes = mount.size_bytes > 0 ? mount.size_bytes : SYNTHETIC_FLOOR_BYTES;
-            const rangeHeader = clientRange;
-            const responseStatus =
-              upstreamResp.status === 200 && rangeHeader ? 206 : upstreamResp.status;
-            const responseStatusText =
-              responseStatus === 206 ? "Partial Content" : upstreamResp.statusText;
+            let responseStatus = upstreamResp.status;
+            let responseStatusText = upstreamResp.statusText;
+            let responseBody: ReadableStream<Uint8Array> | null = upstreamResp.body;
+
+            let reqStart: number | null = null;
+            let reqEnd: number | null = null;
+            if (clientRange) {
+              const match = clientRange.match(/bytes=(\d*)-(\d*)/i);
+              if (match) {
+                if (match[1] !== undefined && match[1] !== "") {
+                  reqStart = parseInt(match[1], 10);
+                }
+                if (match[2] !== undefined && match[2] !== "") {
+                  reqEnd = parseInt(match[2], 10);
+                }
+              }
+            }
 
             const upstreamContentRange = upstreamResp.headers.get("Content-Range");
             const upstreamContentLength = upstreamResp.headers.get("Content-Length");
 
-            if (responseStatus === 206) {
+            if (upstreamResp.status === 206) {
               if (upstreamContentRange) {
                 responseHeaders.set("Content-Range", upstreamContentRange);
-              } else {
-                const len = upstreamContentLength
-                  ? parseInt(upstreamContentLength, 10)
-                  : totalBytes;
-                responseHeaders.set("Content-Range", `bytes 0-${len - 1}/${totalBytes}`);
               }
               if (upstreamContentLength) {
                 responseHeaders.set("Content-Length", upstreamContentLength);
+              }
+            } else if (upstreamResp.status === 200 && clientRange) {
+              if (reqStart === null || reqStart === 0) {
+                responseStatus = 206;
+                responseStatusText = "Partial Content";
+                const endByte =
+                  reqEnd !== null && reqEnd < totalBytes ? reqEnd : totalBytes - 1;
+                const contentLength = endByte + 1;
+                responseHeaders.set("Content-Range", `bytes 0-${endByte}/${totalBytes}`);
+                responseHeaders.set("Content-Length", contentLength.toString());
+                if (reqEnd !== null && reqEnd < totalBytes - 1 && upstreamResp.body) {
+                  responseBody = createRangeStream(upstreamResp.body, 0, contentLength);
+                }
+              } else if (reqStart > 0 && reqStart <= 10 * 1024 * 1024) {
+                // Small seek offset (<= 10MB) on progressive upstream: skip bytes!
+                responseStatus = 206;
+                responseStatusText = "Partial Content";
+                const endByte =
+                  reqEnd !== null && reqEnd < totalBytes ? reqEnd : totalBytes - 1;
+                const contentLength = endByte - reqStart + 1;
+                responseHeaders.set(
+                  "Content-Range",
+                  `bytes ${reqStart}-${endByte}/${totalBytes}`
+                );
+                responseHeaders.set("Content-Length", contentLength.toString());
+                if (upstreamResp.body) {
+                  const take =
+                    reqEnd !== null && reqEnd < totalBytes - 1 ? contentLength : -1;
+                  responseBody = createRangeStream(upstreamResp.body, reqStart, take);
+                }
               } else {
-                responseHeaders.set("Content-Length", totalBytes.toString());
+                // reqStart > 10MB on non-range upstream
+                responseStatus = 416;
+                responseStatusText = "Range Not Satisfiable";
+                responseHeaders.set("Content-Range", `bytes */${totalBytes}`);
+                responseHeaders.set("Content-Length", "0");
+                responseBody = null;
               }
             } else {
               // RFC 9110 Section 14.4: NEVER emit Content-Range on HTTP 200 OK
+              responseStatus = 200;
+              responseStatusText = "OK";
               responseHeaders.delete("Content-Range");
-              if (upstreamContentLength) {
-                responseHeaders.set("Content-Length", upstreamContentLength);
-              } else if (mount.size_bytes > 0) {
-                responseHeaders.set("Content-Length", mount.size_bytes.toString());
-              }
+              responseHeaders.set("Content-Length", totalBytes.toString());
             }
 
             responseHeaders.set(
@@ -1055,7 +1173,7 @@ export default {
 
             responseHeaders.set("Cache-Control", "public, max-age=3600");
 
-            return new Response(upstreamResp.body, {
+            return new Response(responseBody, {
               status: responseStatus,
               statusText: responseStatusText,
               headers: responseHeaders,

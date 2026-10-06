@@ -60,6 +60,7 @@ def is_google_cdn(url_str: str) -> bool:
 def infer_video_type(filename: str, current_type: Optional[str] = None) -> str:
     """
     Infer video MIME type from filename extension, defaulting to video/mp4 for Google CDN streams.
+    File extension (.mkv -> video/x-matroska) takes precedence over upstream generic video/mp4.
     """
     ext = os.path.splitext(filename or "")[1].lower()
     ext_map = {
@@ -76,10 +77,10 @@ def infer_video_type(filename: str, current_type: Optional[str] = None) -> str:
         ".ogv": "video/ogg",
         ".3gp": "video/3gpp"
     }
-    if current_type and current_type.startswith("video/") and current_type != "video/octet-stream":
-        return current_type
     if ext in ext_map:
         return ext_map[ext]
+    if current_type and current_type.startswith("video/") and current_type != "video/octet-stream":
+        return current_type
     return "video/mp4"
 
 # Mount registry store
@@ -520,7 +521,7 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
                 }
             )
         can_seek = mount.get("can_seek", mount.get("range_supported", True))
-        accept_ranges = "none" if (is_google_cdn(upstream_url) and not can_seek) else "bytes"
+        accept_ranges = "bytes"
         headers = {
             "Accept-Ranges": accept_ranges,
             "Content-Type": content_type,
@@ -564,9 +565,8 @@ async def handle_webdav_request(request: Request, path: str) -> Response:
             total_size=total_bytes,
             content_type=content_type
         )
-        can_seek = mount.get("can_seek", mount.get("range_supported", True))
-        if is_google_cdn(upstream_url) and not can_seek:
-            resp.headers["Accept-Ranges"] = "none"
+        # Ensure Accept-Ranges is bytes
+        resp.headers["Accept-Ranges"] = "bytes"
         # RFC 9110: Ensure Content-Range is never emitted if status is 200 OK
         if resp.status_code == 200 and "Content-Range" in resp.headers:
             del resp.headers["Content-Range"]

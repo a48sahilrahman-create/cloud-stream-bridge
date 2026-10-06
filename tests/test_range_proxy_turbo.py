@@ -9,6 +9,7 @@ from range_proxy import (
     is_google_cdn_or_turbo,
     parse_byte_range,
     stream_range_proxy,
+    fetch_segment_data,
     telemetry_stats,
     TURBO_SEGMENT_SIZE,
     CHUNK_SIZE
@@ -19,11 +20,16 @@ def test_google_cdn_and_turbo_detection():
     """Verify Google CDN domain patterns, query params, headers, and overrides."""
     # 1. Google CDN domain matching
     assert is_google_cdn_or_turbo("https://rr1---sn-4g5edn6s.googlevideo.com/videoplayback?expire=123") is True
-    assert is_google_cdn_or_turbo("https://doc-04-00-docs.googleusercontent.com/docs/securesc/xyz") is True
     assert is_google_cdn_or_turbo("https://storage.googleapis.com/stream-bucket/remux.mkv") is True
     assert is_google_cdn_or_turbo("https://drive.google.com/uc?id=file123") is True
     assert is_google_cdn_or_turbo("http://edge-node.1e100.net/data") is True
     assert is_google_cdn_or_turbo("https://redirector.gvt1.com/videoplayback") is True
+
+    # 1b. Google UploadServer does NOT support Range segments and defaults to False
+    assert is_google_cdn_or_turbo("https://doc-04-00-docs.googleusercontent.com/docs/securesc/xyz") is False
+    assert is_google_cdn_or_turbo("https://video-downloads.googleusercontent.com/xyz") is False
+    assert is_google_cdn_or_turbo("https://video-downloads.googleusercontent.com/xyz?turbo=1") is True
+    assert is_google_cdn_or_turbo("https://video-downloads.googleusercontent.com/xyz", turbo=True) is True
 
     # 2. Standard / non-Google URLs
     assert is_google_cdn_or_turbo("https://cdn.cloudflare.com/remux.mkv") is False
@@ -213,3 +219,58 @@ async def test_turbo_immediate_disconnect_trap(monkeypatch):
     # Verify active_streams decremented cleanly back to original
     assert telemetry_stats.get("active_streams", 0) == active_streams_before
     await mock_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_segment_data_raises_value_error_on_200_for_offset():
+    """Verify fetch_segment_data raises ValueError if s_start > 0 and origin returns 200 OK."""
+    class MockOrigin200Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"fake data from byte 0")
+
+    mock_client = httpx.AsyncClient(transport=MockOrigin200Transport())
+    with pytest.raises(ValueError, match="origin does not support Range"):
+        await fetch_segment_data(
+            client=mock_client,
+            url="https://video-downloads.googleusercontent.com/test",
+            s_start=2097152,
+            s_end=4194303,
+            headers={},
+            retries=0
+        )
+    await mock_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_standard_stream_slice_and_skip_on_200(monkeypatch):
+    """Verify standard_chunk_generator slices and skips when upstream returns 200 OK for a range request."""
+    full_payload = bytes(range(256)) * 4  # 1024 bytes (0..255 repeated 4 times)
+    target_start = 100
+    target_end = 299
+    expected_slice = full_payload[target_start:target_end + 1]
+
+    class MockOriginNoRangeTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            # Origin ignores Range header and returns 200 OK with full payload
+            return httpx.Response(200, content=full_payload)
+
+    mock_client = httpx.AsyncClient(transport=MockOriginNoRangeTransport())
+    monkeypatch.setattr("range_proxy.get_shared_client", lambda: mock_client)
+
+    resp = await stream_range_proxy(
+        upstream_url="https://video-downloads.googleusercontent.com/stream.mp4",
+        range_header=f"bytes={target_start}-{target_end}",
+        total_size=len(full_payload),
+        content_type="video/mp4"
+    )
+
+    assert resp.status_code == 206
+    chunks = []
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk)
+
+    received = b"".join(chunks)
+    assert len(received) == len(expected_slice)
+    assert received == expected_slice
+    await mock_client.aclose()
+

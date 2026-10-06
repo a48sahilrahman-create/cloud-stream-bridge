@@ -71,15 +71,16 @@ class MockStreamResponse:
 
 class MockAsyncClient:
     """Mock httpx.AsyncClient for stream_range_proxy."""
-    def __init__(self, chunk_data: bytes = b"GOOGLE_TURBO_STREAM_BYTES" * 64):
+    def __init__(self, chunk_data: bytes = b"GOOGLE_TURBO_STREAM_BYTES" * 64, status_code: int = 206):
         self.chunk_data = chunk_data
+        self.status_code = status_code
         self.is_closed = False
 
     def build_request(self, method, url, headers=None):
         return httpx.Request(method, url, headers=headers)
 
     async def send(self, request, stream=False):
-        return MockStreamResponse(self.chunk_data)
+        return MockStreamResponse(self.chunk_data, status_code=self.status_code)
 
 
 # =============================================================================
@@ -109,7 +110,9 @@ def test_is_google_cdn_detection():
     assert is_google_cdn_url(None) is False
 
     # 3. range_proxy.is_google_cdn_or_turbo
-    assert is_google_cdn_or_turbo(GOOGLE_CDN_SAMPLE_URL) is True
+    # video-downloads.googleusercontent.com (UploadServer) does not support Range segment fetching -> returns False by default
+    assert is_google_cdn_or_turbo(GOOGLE_CDN_SAMPLE_URL) is False
+    assert is_google_cdn_or_turbo(GOOGLE_CDN_SAMPLE_URL, turbo=True) is True
     assert is_google_cdn_or_turbo(GOOGLE_VIDEO_SAMPLE_URL) is True
     assert is_google_cdn_or_turbo("https://storage.googleapis.com/bucket/video.mp4") is True
     assert is_google_cdn_or_turbo("https://example.com/video.mp4?turbo=1") is True
@@ -218,6 +221,9 @@ def test_webdav_head_google_cdn_returns_200_and_mp4():
     )
 
     try:
+        # 0. Verify MKV MIME detection precedence over upstream video/mp4
+        assert infer_video_type("movie.mkv", "video/mp4") == "video/x-matroska"
+
         # 1. Standard HEAD probe
         resp_head = client.head(f"/dav/{filename}")
         assert resp_head.status_code == 200, "HEAD probe must return 200 OK"
@@ -248,6 +254,7 @@ def test_webdav_head_google_cdn_returns_200_and_mp4():
         resp_head_mkv = client.head(f"/dav/{mkv_filename}")
         assert resp_head_mkv.status_code == 200
         assert resp_head_mkv.headers["Content-Type"] == "video/x-matroska"
+        assert resp_head_mkv.headers.get("Accept-Ranges") == "bytes"
         assert "Content-Range" not in resp_head_mkv.headers
 
         # 4. Raw octet-stream MIME auto-correction for .mkv Google CDN stream
@@ -263,9 +270,10 @@ def test_webdav_head_google_cdn_returns_200_and_mp4():
         resp_head_raw_mkv = client.head(f"/dav/{raw_mkv_filename}")
         assert resp_head_raw_mkv.status_code == 200
         assert resp_head_raw_mkv.headers["Content-Type"] == "video/x-matroska"
+        assert resp_head_raw_mkv.headers.get("Accept-Ranges") == "bytes"
         assert "Content-Range" not in resp_head_raw_mkv.headers
 
-        # 5. Google CDN URL that cannot seek must advertise Accept-Ranges: none
+        # 5. HEAD returns Accept-Ranges: bytes
         noseek_filename = "Google_Stream_NoSeek.mkv"
         mount_manager.add_mount(
             movie_id="test_google_head_noseek",
@@ -278,7 +286,7 @@ def test_webdav_head_google_cdn_returns_200_and_mp4():
         )
         resp_head_noseek = client.head(f"/dav/{noseek_filename}")
         assert resp_head_noseek.status_code == 200
-        assert resp_head_noseek.headers.get("Accept-Ranges") == "none"
+        assert resp_head_noseek.headers.get("Accept-Ranges") == "bytes"
         assert "Content-Range" not in resp_head_noseek.headers
     finally:
         mount_manager.remove_mount(filename)
@@ -297,6 +305,7 @@ async def test_range_proxy_turbo_streaming_mocked_google_cdn(monkeypatch):
     """
     Verify stream_range_proxy activates turbo-pipelined streaming for Google CDN URLs,
     populates X-Turbo-Prefetch and X-Streaming-Mode headers, and serves chunks.
+    Also verifies bounded range bytes=0-1023 returns exactly 1024 bytes when upstream returns 200 OK.
     """
     mock_data = b"TURBO_CHUNK_" * 100
     mock_client = MockAsyncClient(chunk_data=mock_data)
@@ -304,9 +313,9 @@ async def test_range_proxy_turbo_streaming_mocked_google_cdn(monkeypatch):
 
     initial_turbo_count = telemetry_stats.get("turbo_requests_served", 0)
 
-    # 1. Google CDN URL triggers turbo mode automatically
+    # 1. Google Video CDN URL triggers turbo mode automatically
     resp_turbo = await stream_range_proxy(
-        upstream_url=GOOGLE_CDN_SAMPLE_URL,
+        upstream_url=GOOGLE_VIDEO_SAMPLE_URL,
         range_header="bytes=0-1023",
         total_size=10485760,  # 10 MB
         content_type="video/mp4"
@@ -340,6 +349,28 @@ async def test_range_proxy_turbo_streaming_mocked_google_cdn(monkeypatch):
     assert resp_std.status_code == 206
     assert "X-Turbo-Prefetch" not in resp_std.headers
     assert "X-Streaming-Mode" not in resp_std.headers
+
+    # 3. Upstream returns 200 OK for bounded range bytes=0-1023: verify chunks sum to 1024 bytes
+    large_stream_data = b"STREAM_DATA_CHUNK_" * 4000  # ~72 KB mock data
+    mock_200_client = MockAsyncClient(chunk_data=large_stream_data, status_code=200)
+    monkeypatch.setattr("range_proxy.get_shared_client", lambda: mock_200_client)
+
+    resp_bounded = await stream_range_proxy(
+        upstream_url=GOOGLE_CDN_SAMPLE_URL,
+        range_header="bytes=0-1023",
+        total_size=len(large_stream_data),
+        content_type="video/mp4"
+    )
+    assert resp_bounded.status_code == 206
+    assert resp_bounded.headers.get("Accept-Ranges") == "bytes"
+    assert resp_bounded.headers.get("Content-Range") == f"bytes 0-1023/{len(large_stream_data)}"
+    assert resp_bounded.headers.get("Content-Length") == "1024"
+
+    bounded_chunks = []
+    async for chunk in resp_bounded.body_iterator:
+        bounded_chunks.append(chunk)
+
+    assert sum(len(c) for c in bounded_chunks) == 1024
 
 
 # =============================================================================

@@ -90,6 +90,11 @@ def is_google_cdn_or_turbo(
     if "turbo=1" in lower_url or "turbo=true" in lower_url:
         return True
 
+    # Note: googleusercontent.com / Google UploadServer does NOT support Range segments.
+    # Using turbo on it loops segment 0 indefinitely. Only use turbo for origins that support Range.
+    if "video-downloads.googleusercontent.com" in lower_url or "googleusercontent.com" in lower_url:
+        return False
+
     # Custom headers detection
     if custom_headers:
         for k, v in custom_headers.items():
@@ -172,6 +177,10 @@ async def fetch_segment_data(
         try:
             req = client.build_request("GET", url, headers=req_headers)
             resp = await client.send(req, stream=True)
+            if s_start > 0 and resp.status_code == 200:
+                raise ValueError(
+                    f"Upstream returned 200 OK for range {s_start}-{s_end}; origin does not support Range."
+                )
             if resp.status_code not in (200, 206):
                 logger.warning(
                     f"Upstream returned status {resp.status_code} for range {s_start}-{s_end} (attempt {attempt + 1})"
@@ -367,11 +376,39 @@ async def stream_range_proxy(
                 client.build_request("GET", upstream_url, headers=upstream_req_headers),
                 stream=True
             )
-            async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
-                telemetry_stats["total_bytes_streamed"] += len(chunk)
-                yield chunk
+            # If upstream returned 200 OK for a range request:
+            if resp.status_code == 200 and range_header:
+                skipped = 0
+                yielded = 0
+                needed = (end - start + 1) if (end >= start and total_size > 0) else None
+
+                async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
+                    if skipped < start:
+                        needed_skip = start - skipped
+                        if len(chunk) <= needed_skip:
+                            skipped += len(chunk)
+                            continue
+                        else:
+                            chunk = chunk[needed_skip:]
+                            skipped = start
+
+                    if needed is not None:
+                        remaining_needed = needed - yielded
+                        if len(chunk) > remaining_needed:
+                            chunk = chunk[:remaining_needed]
+
+                    if chunk:
+                        telemetry_stats["total_bytes_streamed"] += len(chunk)
+                        yield chunk
+                        yielded += len(chunk)
+
+                    if needed is not None and yielded >= needed:
+                        break
+            else:
+                async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
+                    telemetry_stats["total_bytes_streamed"] += len(chunk)
+                    yield chunk
         except (asyncio.CancelledError, GeneratorExit):
-            # Client scrubbed timeline / aborted playback — trap and clean up immediately
             logger.info(f"Client disconnected / scrubbed: range {start}-{end}")
         except Exception as e:
             logger.error(f"Upstream stream error: {e}")

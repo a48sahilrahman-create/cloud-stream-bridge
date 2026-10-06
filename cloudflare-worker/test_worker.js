@@ -155,7 +155,9 @@ globalThis.fetch = async (input, init = {}) => {
       ? 'application/octet-stream'
       : 'video/mp4';
 
-    return new Response('fake-google-stream-body', {
+    const mockBody = new Uint8Array(65536).fill(65);
+
+    return new Response(mockBody, {
       status: 200,
       statusText: 'OK',
       headers: {
@@ -834,8 +836,16 @@ await runTest('26. Test WebDAV GET on Google CDN stream forces proxying bypassin
   const getRes = await worker.fetch(getReq, mockEnv, mockCtx);
   assert.notStrictEqual(getRes.status, 302, 'GET on Google CDN URL must NOT return 302 redirect');
   assert.strictEqual(getRes.status, 206, 'GET on Google CDN URL must return proxied response');
-  assert.strictEqual(getRes.headers.get('Accept-Ranges'), 'none');
+  assert.strictEqual(getRes.headers.get('Accept-Ranges'), 'bytes');
   assert.strictEqual(getRes.headers.get('Content-Type'), 'video/mp4');
+  const contentRange = getRes.headers.get('Content-Range') || '';
+  assert.ok(
+    contentRange.startsWith('bytes 0-15/'),
+    `Expected Content-Range starting with 'bytes 0-15/', got: ${contentRange}`
+  );
+  assert.strictEqual(getRes.headers.get('Content-Length'), '16');
+  const bodyBuf = await getRes.arrayBuffer();
+  assert.strictEqual(bodyBuf.byteLength, 16);
 });
 
 // Test 27: Proxy response forces Content-Type to video/mp4 or inferred video MIME type
@@ -859,7 +869,7 @@ await runTest('27. Test proxy response forces video Content-Type overriding octe
   const getResHtml = await worker.fetch(getReqHtml, mockEnv, mockCtx);
   assert.strictEqual(getResHtml.status, 200);
   assert.strictEqual(getResHtml.headers.get('Content-Type'), 'video/x-matroska', 'Should infer video/x-matroska from .mkv');
-  assert.strictEqual(getResHtml.headers.get('Accept-Ranges'), 'none', 'Google CDN proxy response must advertise Accept-Ranges: none');
+  assert.strictEqual(getResHtml.headers.get('Accept-Ranges'), 'bytes', 'Google CDN proxy response must advertise Accept-Ranges: bytes');
 
   // 27b: Mount with unknown extension and upstream returning application/octet-stream -> defaults to video/mp4
   const mountReqOctet = new Request('https://edge.cloudstream.local/api/mount/user_google_mime', {
@@ -880,7 +890,7 @@ await runTest('27. Test proxy response forces video Content-Type overriding octe
   const getResOctet = await worker.fetch(getReqOctet, mockEnv, mockCtx);
   assert.strictEqual(getResOctet.status, 200);
   assert.strictEqual(getResOctet.headers.get('Content-Type'), 'video/x-matroska');
-  assert.strictEqual(getResOctet.headers.get('Accept-Ranges'), 'none');
+  assert.strictEqual(getResOctet.headers.get('Accept-Ranges'), 'bytes');
 });
 
 // Test 28: HEAD on mounted Google CDN stream returns synthetic 200 OK
@@ -890,7 +900,7 @@ await runTest('28. Test HEAD on mounted Google CDN stream returns synthetic 200 
   });
   const headRes = await worker.fetch(headReq, mockEnv, mockCtx);
   assert.strictEqual(headRes.status, 200, 'HEAD must return 200 OK synthetic response');
-  assert.strictEqual(headRes.headers.get('Accept-Ranges'), 'none');
+  assert.strictEqual(headRes.headers.get('Accept-Ranges'), 'bytes');
   assert.strictEqual(headRes.headers.get('Content-Type'), 'video/mp4');
   assert.strictEqual(headRes.headers.get('Content-Length'), '107374182400');
   assert.strictEqual(headRes.headers.get('DAV'), '1, 2');
@@ -923,7 +933,7 @@ await runTest('30. Test GET on Google CDN stream with Range: bytes=0- synthesize
   const res = await worker.fetch(req, mockEnv, mockCtx);
 
   assert.strictEqual(res.status, 206, 'Must synthesize HTTP 206 Partial Content when Range is requested');
-  assert.strictEqual(res.headers.get('Accept-Ranges'), 'none');
+  assert.strictEqual(res.headers.get('Accept-Ranges'), 'bytes');
   const contentRange = res.headers.get('Content-Range');
   assert.ok(contentRange, 'Content-Range header must be present on 206 response');
   assert.ok(
@@ -941,13 +951,13 @@ await runTest('31. Test GET on Google CDN stream without Range returns HTTP 200 
   const res = await worker.fetch(req, mockEnv, mockCtx);
 
   assert.strictEqual(res.status, 200, 'Must return HTTP 200 OK when no Range header is sent');
-  assert.strictEqual(res.headers.get('Accept-Ranges'), 'none');
+  assert.strictEqual(res.headers.get('Accept-Ranges'), 'bytes');
   assert.strictEqual(res.headers.get('Content-Range'), null, 'Content-Range must NEVER be present on HTTP 200 OK (RFC 9110 Section 14.4)');
   assert.strictEqual(res.headers.get('Content-Length'), '107374182400');
 });
 
-// Test 32: HEAD on Google CDN stream returns accept-ranges: none
-await runTest('32. Test HEAD on Google CDN stream returns accept-ranges: none', async () => {
+// Test 32: HEAD on Google CDN stream returns accept-ranges: bytes
+await runTest('32. Test HEAD on Google CDN stream returns accept-ranges: bytes', async () => {
   const mountReq = new Request('https://edge.cloudstream.local/api/mount/user_google_mkv_test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -965,9 +975,69 @@ await runTest('32. Test HEAD on Google CDN stream returns accept-ranges: none', 
   const headRes = await worker.fetch(headReq, mockEnv, mockCtx);
 
   assert.strictEqual(headRes.status, 200);
-  assert.strictEqual(headRes.headers.get('Accept-Ranges'), 'none', 'Google CDN HEAD must return Accept-Ranges: none');
+  assert.strictEqual(headRes.headers.get('Accept-Ranges'), 'bytes', 'Google CDN HEAD must return Accept-Ranges: bytes');
   assert.strictEqual(headRes.headers.get('Content-Type'), 'video/x-matroska', 'Must infer video/x-matroska from .mkv');
   assert.strictEqual(headRes.headers.get('Content-Length'), '20000000000');
+});
+
+// Test 33: GET with bounded probe Range: bytes=0-1023 returns status 206, Content-Range: bytes 0-1023/..., Content-Length: 1024, and received body is exactly 1024 bytes
+await runTest('33. Test GET with bounded probe Range: bytes=0-1023 returns status 206 and exactly 1024 bytes', async () => {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+    method: 'GET',
+    headers: { Range: 'bytes=0-1023' },
+  });
+  const res = await worker.fetch(req, mockEnv, mockCtx);
+
+  assert.strictEqual(res.status, 206);
+  assert.strictEqual(res.headers.get('Accept-Ranges'), 'bytes');
+  const contentRange = res.headers.get('Content-Range') || '';
+  assert.ok(
+    contentRange.startsWith('bytes 0-1023/'),
+    `Expected Content-Range starting with 'bytes 0-1023/', got: ${contentRange}`
+  );
+  assert.strictEqual(res.headers.get('Content-Length'), '1024');
+  const bodyBuf = await res.arrayBuffer();
+  assert.strictEqual(bodyBuf.byteLength, 1024);
+});
+
+// Test 34: GET with small seek Range: bytes=100-199 returns status 206, Content-Range: bytes 100-199/..., Content-Length: 100
+await runTest('34. Test GET with small seek Range: bytes=100-199 returns status 206 and Content-Length 100', async () => {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+    method: 'GET',
+    headers: { Range: 'bytes=100-199' },
+  });
+  const res = await worker.fetch(req, mockEnv, mockCtx);
+
+  assert.strictEqual(res.status, 206);
+  assert.strictEqual(res.headers.get('Accept-Ranges'), 'bytes');
+  const contentRange = res.headers.get('Content-Range') || '';
+  assert.ok(
+    contentRange.startsWith('bytes 100-199/'),
+    `Expected Content-Range starting with 'bytes 100-199/', got: ${contentRange}`
+  );
+  assert.strictEqual(res.headers.get('Content-Length'), '100');
+  const bodyBuf = await res.arrayBuffer();
+  assert.strictEqual(bodyBuf.byteLength, 100);
+});
+
+// Test 35: GET with large seek Range: bytes=20000000- on Google CDN returns status 416, Content-Range: bytes */..., Content-Length: 0
+await runTest('35. Test GET with large seek Range: bytes=20000000- on Google CDN returns status 416', async () => {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+    method: 'GET',
+    headers: { Range: 'bytes=20000000-' },
+  });
+  const res = await worker.fetch(req, mockEnv, mockCtx);
+
+  assert.strictEqual(res.status, 416);
+  assert.strictEqual(res.headers.get('Accept-Ranges'), 'bytes');
+  const contentRange = res.headers.get('Content-Range') || '';
+  assert.ok(
+    contentRange.startsWith('bytes */'),
+    `Expected Content-Range starting with 'bytes */', got: ${contentRange}`
+  );
+  assert.strictEqual(res.headers.get('Content-Length'), '0');
+  const bodyBuf = await res.arrayBuffer();
+  assert.strictEqual(bodyBuf.byteLength, 0);
 });
 
 console.log(`\nAll tests passed successfully! Total: ${testsPassed}`);

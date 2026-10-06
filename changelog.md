@@ -1,6 +1,25 @@
 # Changelog & Architectural State — CloudStream WebDAV Bridge
 
 ## Current State
+- **Media Stream Playback & Range Resolution Deployed & Verified (CX File Explorer, VLC, MPV, PLAYit)**:
+  - **Plan Executed**: `plans/bubbly-sparking-flurry.md` & `plans/google-cdn-streaming-cx-vlc-resolution-plan.md` (all 5 steps complete & verified).
+  - **Root Cause Defects Resolved**:
+    1. *Accept-Ranges Scrubbing Regression*: Restored `Accept-Ranges: bytes` across HEAD, GET, and PROPFIND endpoints so VLC, MPV, and Android media players preserve timeline seek bars, scrub controls, and resume playback.
+    2. *Synthetic 206 Offset Mismatch & ExoPlayer POSITION_OUT_OF_RANGE*: Replaced fake byte-0 `Content-Range` synthesis with strict RFC 9110 compliant range handling. Added `createRangeStream` stream transform to skip bytes on progressive upstreams for seek offsets <= 10MB, and return compliant `416 Range Not Satisfiable` for seeks > 10MB, eliminating the fatal `0x7f130158 Playback error` in CX File Explorer.
+    3. *Bounded Range Probe Slicing*: Fixed header probes (`Range: bytes=0-1023`) to slice the response stream to exactly `end - start + 1` bytes with matching `Content-Length`, preventing multi-gigabyte data dumps on 1KB probes.
+    4. *`range_proxy.py` Turbo Prefetch Loop Bug*: Disabled multi-connection segment prefetching for Google UploadServer (`googleusercontent.com`), eliminating the infinite segment-0 playback loop and adding byte-skipping/slicing in `standard_chunk_generator()`.
+    5. *MIME Type Precedence*: Prioritized file extension mapping (`.mkv` -> `video/x-matroska`) over generic upstream `video/mp4` across both Python and Cloudflare Worker engines.
+  - **Files Modified**:
+    - `cloudflare-worker/src/index.ts`: Added `createRangeStream` for bounded slicing and byte skipping; restored `Accept-Ranges: bytes`; implemented RFC 9110 Section 14.4 compliant 206/416 range handling.
+    - `cloudflare-worker/test_worker.js`: Updated tests 26–35 to validate `Accept-Ranges: bytes`, exact bounded probe slicing (`bytes=0-1023`), small seek slicing (`bytes=100-199`), and large seek rejection (416).
+    - `range_proxy.py`: Guarded `is_google_cdn_or_turbo` to disable turbo on `googleusercontent.com`; added 200 OK check in `fetch_segment_data()`; added byte-skipping and bounded slicing to `standard_chunk_generator()`.
+    - `webdav_engine.py`: Fixed `infer_video_type` precedence and enforced `Accept-Ranges: bytes` across HEAD and GET.
+    - `tests/test_google_stream_turbo.py`: Updated assertions for non-turbo sequential fallback, MKV MIME type precedence, and bounded range slicing.
+    - `tests/test_range_proxy_turbo.py`: Added assertions for non-range 200 detection and bounded range slicing.
+  - **Verification Verdict**:
+    - **Cloudflare Worker Unit Suite**: 35/35 tests passing (`node cloudflare-worker/test_worker.js`).
+    - **Python WebDAV & Range Suite**: 89/89 tests passing (`pytest tests/`).
+    - **TypeScript Compilation**: Clean (`npx tsc --noEmit`).
 - **Google CDN Stream Playback & Stuttering Resolution Deployed & Verified**:
   - **Plan Executed**: `plans/google-cdn-streaming-cx-vlc-resolution-plan.md` (all 5 steps complete).
   - **Files Modified**:
