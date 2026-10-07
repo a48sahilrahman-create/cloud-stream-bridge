@@ -309,6 +309,8 @@
 - Hugging Face Spaces now requires a paid PRO subscription for custom CPU compute spaces.
 
 ## Important Decisions
+- **ExoPlayer MatroskaExtractor Cue-Seeking Suppression & Duplicate Segment Bypass (`ax/I1/e.smali`)**: In MKV containers, the seek index (`Cues`, `0x1C53BB6B`) is placed at the file tail. ExoPlayer's `MatroskaExtractor` (`ax.I1.e`) defaults to `seekForCuesEnabled = true`. Progressive endpoints (`video-downloads.googleusercontent.com`, `server: UploadServer`) reject byte-range requests and stream `200 OK` from byte 0. Seeking to the tail causes ExoPlayer to read byte 0 at offset 27.5GB, encountering the Segment element (`0x18538067`) twice and crashing with `Multiple Segment elements not supported` (`ERROR_CODE_PARSING_CONTAINER_MALFORMED`). Patched Dalvik bytecode in `ax/I1/e.smali`: set `this.d = 0` (`FLAG_DISABLE_SEEK_FOR_CUES = 1`) to bypass cue seeking and publish `SeekMap.Unseekable` immediately, and replaced `:cond_5` throw with `goto :goto_1` to neutralize duplicate segment exceptions.
+- **ExoPlayer 100MB Buffer Smali Expansion (`androidx/media3/exoplayer/j.1.smali`)**: Stock ExoPlayer in CX File Explorer buffers ~13MB / 50s. Once filled, socket reads halt, filling kernel `SO_RCVBUF` and emitting `rwnd = 0` (TCP ZeroWindow), collapsing upstream CDN `cwnd` and throttling sustained streaming to kbps. Patched `androidx/media3/exoplayer/j.1.smali` constructor and track allocation floors to 100MB (`0x6400000`), 2m min buffer (`120,000ms`), 5m max buffer (`300,000ms`), and `prioritizeTimeOverSizeThresholds = true` to maintain continuous wire-speed socket draining.
 - **Dedicated Backup Repository & Frozen Baseline Snapshot Protocol**:
   - **Primary GitHub Repository**: `https://github.com/a48sahilrahman-create/cloud-stream-bridge`
   - **Dedicated Backup Repository**: `https://github.com/a48sahilrahman-create/cloud-stream-bridge-backup` (exact frozen working baseline snapshot).
@@ -325,7 +327,9 @@
 - **Local Wi-Fi First for 4K Remux**: Recommended local LAN IP (`192.168.220.41:7860`) for home Android TV playback to achieve maximum unthrottled local bitrate with zero cloud proxy latency.
 
 ## Next Steps
-- Monitor live Worker deployment (version `12cfe72c-e53e-482c-a12e-0a99cddfc50d`) telemetry under high-bitrate 4K UHD Remux playback in CX File Explorer and ExoPlayer to confirm elimination of range chunk thrashing via `Cache-Control: private, max-age=1800, stale-while-revalidate=300`, `Vary: Range`, and `Keep-Alive: timeout=60, max=1000`.
+- Verify live playback of 27.5 GB 4K MKV stream on user's Realme X7 Max 5G in patched CX File Explorer (v2.7.8) to confirm seamless sequential playback from byte 0 and continuous buffer fill into the 100MB pipeline without container parsing crashes.
+- Monitor sustained throughput in CX File Explorer network statistics to confirm wire-speed data consumption without TCP ZeroWindow throttling.
+- Monitor live Worker deployment (version `7ac33269-6143-4adf-9d03-a3522e1e0ef0`) telemetry under high-bitrate 4K UHD Remux playback in CX File Explorer and ExoPlayer.
 - Verify real-world time-to-first-frame (TTFB) and seek responsiveness on cold upstream storage objects pre-warmed via `warmStreamStorage`.
 - Add persistent volume metadata caching for presigned URL expiration rollover.
 - Add optional tokenized Basic Authentication for public internet deployments when desired.
