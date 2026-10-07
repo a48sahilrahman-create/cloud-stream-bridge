@@ -24,7 +24,7 @@ logger = logging.getLogger("range_proxy")
 # Buffer & Segment Configurations
 CHUNK_SIZE = 128 * 1024  # 128 KB buffer chunks for low latency & high throughput
 TURBO_SEGMENT_SIZE = 2 * 1024 * 1024  # 2 MB segments for Google CDN range chunking
-TURBO_PREFETCH_AHEAD = 2  # Prefetch up to 2 segments ahead (4 MB lookahead window)
+TURBO_PREFETCH_AHEAD = 4  # Prefetch up to 4 segments ahead (8 MB lookahead window)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"

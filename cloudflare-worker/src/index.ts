@@ -1094,6 +1094,7 @@ export default {
 
             let reqStart: number | null = null;
             let reqEnd: number | null = null;
+            let isSuffixRange = false;
             if (clientRange) {
               const match = clientRange.match(/bytes=(\d*)-(\d*)/i);
               if (match) {
@@ -1102,6 +1103,9 @@ export default {
                 }
                 if (match[2] !== undefined && match[2] !== "") {
                   reqEnd = parseInt(match[2], 10);
+                }
+                if ((match[1] === undefined || match[1] === "") && reqEnd !== null) {
+                  isSuffixRange = true;
                 }
               }
             }
@@ -1117,7 +1121,7 @@ export default {
                 responseHeaders.set("Content-Length", upstreamContentLength);
               }
             } else if (upstreamResp.status === 200 && clientRange) {
-              if (reqStart === null || reqStart === 0) {
+              if (!isSuffixRange && (reqStart === null || reqStart === 0)) {
                 responseStatus = 206;
                 responseStatusText = "Partial Content";
                 const endByte =
@@ -1128,7 +1132,7 @@ export default {
                 if (reqEnd !== null && reqEnd < totalBytes - 1 && upstreamResp.body) {
                   responseBody = createRangeStream(upstreamResp.body, 0, contentLength);
                 }
-              } else if (reqStart > 0 && reqStart <= 10 * 1024 * 1024) {
+              } else if (!isSuffixRange && reqStart !== null && reqStart > 0 && reqStart <= 10 * 1024 * 1024) {
                 // Small seek offset (<= 10MB) on progressive upstream: skip bytes!
                 responseStatus = 206;
                 responseStatusText = "Partial Content";
@@ -1146,12 +1150,16 @@ export default {
                   responseBody = createRangeStream(upstreamResp.body, reqStart, take);
                 }
               } else {
-                // reqStart > 10MB on non-range upstream
-                responseStatus = 416;
-                responseStatusText = "Range Not Satisfiable";
-                responseHeaders.set("Content-Range", `bytes */${totalBytes}`);
-                responseHeaders.set("Content-Length", "0");
-                responseBody = null;
+                // reqStart > 10MB or suffix range on non-range upstream:
+                // RFC 9110 Section 14.2: When origin cannot satisfy byte range, the server MAY ignore
+                // the Range header and return the entire representation with 200 OK.
+                // This satisfies OkHttp validation in CX File Explorer (isSuccessful() === true)
+                // and avoids crashing WebDAV playback with 416 Range Not Satisfiable.
+                responseStatus = 200;
+                responseStatusText = "OK";
+                responseHeaders.delete("Content-Range");
+                responseHeaders.set("Content-Length", totalBytes.toString());
+                responseBody = upstreamResp.body;
               }
             } else {
               // RFC 9110 Section 14.4: NEVER emit Content-Range on HTTP 200 OK

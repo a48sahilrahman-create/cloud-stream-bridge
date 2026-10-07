@@ -1,6 +1,24 @@
 # Changelog & Architectural State — CloudStream WebDAV Bridge
 
 ## Current State
+- **ExoPlayer 100MB Buffer Smali Expansion & Throughput Acceleration Deployed & Verified (CX File Explorer APK & Bridge)**:
+  - **Problem Resolved**: 1DM saturates wire speed (multi-MB/s) while video player streams throttle down to kbps after starting playback.
+  - **Root Cause Confirmed**: Demand-driven backpressure. Stock ExoPlayer in CX File Explorer (`androidx.media3.exoplayer.DefaultLoadControl`) buffers only ~13 MB / 50s. Once filled, socket reads halt -> kernel `SO_RCVBUF` exhausts -> TCP ZeroWindow (`rwnd=0`) advertised -> upstream CDN congestion window (`cwnd`) collapses -> subsequent reads throttle to 1.0x playback rate (~200-500 kbps).
+  - **Smali Bytecode Patches (`C:\Users\sahil\workspaces\cx-file-explorer-mod\cx_decompiled\smali\androidx\media3\exoplayer\j.1.smali`)**:
+    1. *Constructor `<init>()V`*: Increased `minBufferMs` from 50,000 to 120,000 ms (2m), `maxBufferMs` from 50,000 to 300,000 ms (5m), `targetBufferBytes` from -1 to 100 MB (`0x6400000` / 104,857,600 bytes), and `prioritizeTimeOverSizeThresholds` to true (`0x1`).
+    2. *Track Buffer Allocation `n(I)I`*: Set video track allocation floor to 100 MB (`0x6400000`).
+    3. *Session Allocation `p(Lax/Z0/I1;)V`*: Set dynamic track fallback to 100 MB (`0x6400000`).
+    4. *Target Buffer Calculation `l([Lax/l1/D;)I`*: Replaced `0xc80000` floor with 100 MB (`0x6400000`).
+  - **APK Assembly & Verification**:
+    - Recompiled with `apktool.jar`, aligned with `zipalign.exe` (4-byte page boundary), and signed with `apksigner.bat` via Android debug keystore.
+    - Verified APK signatures: v1 scheme: true, v2 scheme: true, v3 scheme: true (`cx_file_explorer_custom_aspect_ratio_mod.apk`).
+  - **Bridge Lookahead Optimization (`range_proxy.py`)**:
+    - Expanded `TURBO_PREFETCH_AHEAD` from 2 to 4 segments (8 MB lookahead window) for parallel upstream fetching.
+    - Verified test suite: 89/89 tests passing (`pytest tests/`).
+  - **Live Device Deployment & Verification (Realme X7 Max 5G RMX3031 via Wireless ADB)**:
+    - Connected over TLS wireless debugging on `192.168.220.34:34367`.
+    - Pushed APK directly to device storage: `/sdcard/Download/cx_file_explorer_100mb_buffer_mod.apk` (12 MB transferred at 25 MB/s).
+    - Executed live in-place package update via `adb install -r -d`: `Performing Streamed Install -> Success` (Package: `com.cxinventor.file.explorer`, updated at `2026-10-07 19:09:02`).
 - **Media Stream Playback & Range Resolution Deployed & Verified (CX File Explorer, VLC, MPV, PLAYit)**:
   - **Plan Executed**: `plans/bubbly-sparking-flurry.md` & `plans/google-cdn-streaming-cx-vlc-resolution-plan.md` (all 5 steps complete & verified).
   - **Root Cause Defects Resolved**:

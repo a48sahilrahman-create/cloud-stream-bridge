@@ -1020,24 +1020,36 @@ await runTest('34. Test GET with small seek Range: bytes=100-199 returns status 
   assert.strictEqual(bodyBuf.byteLength, 100);
 });
 
-// Test 35: GET with large seek Range: bytes=20000000- on Google CDN returns status 416, Content-Range: bytes */..., Content-Length: 0
-await runTest('35. Test GET with large seek Range: bytes=20000000- on Google CDN returns status 416', async () => {
+// Test 35: GET with large seek Range: bytes=20000000- on Google CDN returns status 200 OK per RFC 9110 Section 14.2
+await runTest('35. Test GET with large seek Range: bytes=20000000- on Google CDN returns status 200 OK (RFC 9110 Section 14.2)', async () => {
   const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
     method: 'GET',
     headers: { Range: 'bytes=20000000-' },
   });
   const res = await worker.fetch(req, mockEnv, mockCtx);
 
-  assert.strictEqual(res.status, 416);
+  assert.strictEqual(res.status, 200);
   assert.strictEqual(res.headers.get('Accept-Ranges'), 'bytes');
-  const contentRange = res.headers.get('Content-Range') || '';
-  assert.ok(
-    contentRange.startsWith('bytes */'),
-    `Expected Content-Range starting with 'bytes */', got: ${contentRange}`
-  );
-  assert.strictEqual(res.headers.get('Content-Length'), '0');
+  assert.strictEqual(res.headers.get('Content-Range'), null);
+  assert.strictEqual(res.headers.get('Content-Length'), '107374182400');
   const bodyBuf = await res.arrayBuffer();
-  assert.strictEqual(bodyBuf.byteLength, 0);
+  assert.strictEqual(bodyBuf.byteLength, 65536);
+});
+
+// Test 36: GET with suffix Range: bytes=-1024 on Google CDN returns status 200 OK per RFC 9110 Section 14.2
+await runTest('36. Test GET with suffix Range: bytes=-1024 on Google CDN returns status 200 OK (RFC 9110 Section 14.2)', async () => {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+    method: 'GET',
+    headers: { Range: 'bytes=-1024' },
+  });
+  const res = await worker.fetch(req, mockEnv, mockCtx);
+
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.headers.get('Accept-Ranges'), 'bytes');
+  assert.strictEqual(res.headers.get('Content-Range'), null);
+  assert.strictEqual(res.headers.get('Content-Length'), '107374182400');
+  const bodyBuf = await res.arrayBuffer();
+  assert.strictEqual(bodyBuf.byteLength, 65536);
 });
 
 console.log(`\nAll tests passed successfully! Total: ${testsPassed}`);
