@@ -812,8 +812,8 @@ await runTest('25. Test isGoogleCdn helper detects Google CDN domains correctly'
   assert.strictEqual(isGoogleCdn(''), false);
 });
 
-// Test 26: WebDAV GET on mounted Google CDN stream forces proxying (no 302 redirect)
-await runTest('26. Test WebDAV GET on Google CDN stream forces proxying bypassing 302 redirect', async () => {
+// Test 26: WebDAV GET on Google CDN stream defaults to 302 Found redirection and proxies with ?proxy=1
+await runTest('26. Test WebDAV GET on Google CDN stream defaults to 302 Found redirection and proxies with ?proxy=1', async () => {
   // Mount a stream from Google CDN
   const mountReq = new Request('https://edge.cloudstream.local/api/mount/user_google_test', {
     method: 'POST',
@@ -828,23 +828,32 @@ await runTest('26. Test WebDAV GET on Google CDN stream forces proxying bypassin
   const mountRes = await worker.fetch(mountReq, mockEnv, mockCtx);
   assert.strictEqual(mountRes.status, 200);
 
-  // Normal GET request without ?proxy=1 should be forced into proxy mode (not 302 redirect!)
+  // Normal GET request without ?proxy=1 should default to 302 redirect for full wire speed
   const getReq = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
     method: 'GET',
     headers: { Range: 'bytes=0-15' },
   });
   const getRes = await worker.fetch(getReq, mockEnv, mockCtx);
-  assert.notStrictEqual(getRes.status, 302, 'GET on Google CDN URL must NOT return 302 redirect');
-  assert.strictEqual(getRes.status, 206, 'GET on Google CDN URL must return proxied response');
+  assert.strictEqual(getRes.status, 302, 'GET on Google CDN URL must default to 302 redirect');
+  assert.strictEqual(getRes.headers.get('Location'), 'https://video-downloads.googleusercontent.com/sample_video');
   assert.strictEqual(getRes.headers.get('Accept-Ranges'), 'bytes');
-  assert.strictEqual(getRes.headers.get('Content-Type'), 'video/mp4');
-  const contentRange = getRes.headers.get('Content-Range') || '';
+
+  // Explicit proxy GET request with ?proxy=1 returns proxied response
+  const proxyReq = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4?proxy=1', {
+    method: 'GET',
+    headers: { Range: 'bytes=0-15' },
+  });
+  const proxyRes = await worker.fetch(proxyReq, mockEnv, mockCtx);
+  assert.strictEqual(proxyRes.status, 206, 'GET on Google CDN URL with ?proxy=1 must return proxied response');
+  assert.strictEqual(proxyRes.headers.get('Accept-Ranges'), 'bytes');
+  assert.strictEqual(proxyRes.headers.get('Content-Type'), 'video/mp4');
+  const contentRange = proxyRes.headers.get('Content-Range') || '';
   assert.ok(
     contentRange.startsWith('bytes 0-15/'),
     `Expected Content-Range starting with 'bytes 0-15/', got: ${contentRange}`
   );
-  assert.strictEqual(getRes.headers.get('Content-Length'), '16');
-  const bodyBuf = await getRes.arrayBuffer();
+  assert.strictEqual(proxyRes.headers.get('Content-Length'), '16');
+  const bodyBuf = await proxyRes.arrayBuffer();
   assert.strictEqual(bodyBuf.byteLength, 16);
 });
 
@@ -863,7 +872,7 @@ await runTest('27. Test proxy response forces video Content-Type overriding octe
   });
   await worker.fetch(mountReqHtml, mockEnv, mockCtx);
 
-  const getReqHtml = new Request('https://edge.cloudstream.local/dav/user_google_mime/MovieHtml.mkv', {
+  const getReqHtml = new Request('https://edge.cloudstream.local/dav/user_google_mime/MovieHtml.mkv?proxy=1', {
     method: 'GET',
   });
   const getResHtml = await worker.fetch(getReqHtml, mockEnv, mockCtx);
@@ -884,7 +893,7 @@ await runTest('27. Test proxy response forces video Content-Type overriding octe
   });
   await worker.fetch(mountReqOctet, mockEnv, mockCtx);
 
-  const getReqOctet = new Request('https://edge.cloudstream.local/dav/user_google_mime/ClipUnknown.mkv', {
+  const getReqOctet = new Request('https://edge.cloudstream.local/dav/user_google_mime/ClipUnknown.mkv?proxy=1', {
     method: 'GET',
   });
   const getResOctet = await worker.fetch(getReqOctet, mockEnv, mockCtx);
@@ -922,9 +931,9 @@ await runTest('29. Test HEAD on tunnel fallback never redirects Google CDN URLs'
   assert.strictEqual(headRes.headers.get('Content-Length'), '107374182400');
 });
 
-// Test 30: GET on Google CDN stream with Range: bytes=0- synthesizes HTTP 206 with content-range
+// Test 30: GET on Google CDN stream with ?proxy=1 and Range: bytes=0- synthesizes HTTP 206 with content-range
 await runTest('30. Test GET on Google CDN stream with Range: bytes=0- synthesizes HTTP 206 with content-range', async () => {
-  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4?proxy=1', {
     method: 'GET',
     headers: {
       Range: 'bytes=0-',
@@ -943,9 +952,9 @@ await runTest('30. Test GET on Google CDN stream with Range: bytes=0- synthesize
   assert.strictEqual(res.headers.get('Content-Length'), '107374182400');
 });
 
-// Test 31: GET on Google CDN stream without Range returns HTTP 200 with NO content-range
+// Test 31: GET on Google CDN stream with ?proxy=1 without Range returns HTTP 200 with NO content-range
 await runTest('31. Test GET on Google CDN stream without Range returns HTTP 200 with NO content-range', async () => {
-  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4?proxy=1', {
     method: 'GET',
   });
   const res = await worker.fetch(req, mockEnv, mockCtx);
@@ -982,7 +991,7 @@ await runTest('32. Test HEAD on Google CDN stream returns accept-ranges: bytes',
 
 // Test 33: GET with bounded probe Range: bytes=0-1023 returns status 206, Content-Range: bytes 0-1023/..., Content-Length: 1024, and received body is exactly 1024 bytes
 await runTest('33. Test GET with bounded probe Range: bytes=0-1023 returns status 206 and exactly 1024 bytes', async () => {
-  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4?proxy=1', {
     method: 'GET',
     headers: { Range: 'bytes=0-1023' },
   });
@@ -1002,7 +1011,7 @@ await runTest('33. Test GET with bounded probe Range: bytes=0-1023 returns statu
 
 // Test 34: GET with small seek Range: bytes=100-199 returns status 206, Content-Range: bytes 100-199/..., Content-Length: 100
 await runTest('34. Test GET with small seek Range: bytes=100-199 returns status 206 and Content-Length 100', async () => {
-  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4?proxy=1', {
     method: 'GET',
     headers: { Range: 'bytes=100-199' },
   });
@@ -1020,25 +1029,28 @@ await runTest('34. Test GET with small seek Range: bytes=100-199 returns status 
   assert.strictEqual(bodyBuf.byteLength, 100);
 });
 
-// Test 35: GET with large seek Range: bytes=20000000- on Google CDN returns status 200 OK per RFC 9110 Section 14.2
-await runTest('35. Test GET with large seek Range: bytes=20000000- on Google CDN returns status 200 OK (RFC 9110 Section 14.2)', async () => {
-  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+// Test 35: GET with large seek Range: bytes=20000000- with ?proxy=1 returns status 206 Partial Content (streams from reqStart)
+await runTest('35. Test GET with large seek Range: bytes=20000000- with ?proxy=1 returns status 206 Partial Content', async () => {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4?proxy=1', {
     method: 'GET',
     headers: { Range: 'bytes=20000000-' },
   });
   const res = await worker.fetch(req, mockEnv, mockCtx);
 
-  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.status, 206);
   assert.strictEqual(res.headers.get('Accept-Ranges'), 'bytes');
-  assert.strictEqual(res.headers.get('Content-Range'), null);
-  assert.strictEqual(res.headers.get('Content-Length'), '107374182400');
-  const bodyBuf = await res.arrayBuffer();
-  assert.strictEqual(bodyBuf.byteLength, 65536);
+  const contentRange = res.headers.get('Content-Range') || '';
+  assert.ok(
+    contentRange.startsWith('bytes 20000000-'),
+    `Expected Content-Range starting with 'bytes 20000000-', got: ${contentRange}`
+  );
+  const expectedLength = (107374182400 - 20000000).toString();
+  assert.strictEqual(res.headers.get('Content-Length'), expectedLength);
 });
 
 // Test 36: GET with suffix Range: bytes=-1024 on Google CDN returns status 200 OK per RFC 9110 Section 14.2
 await runTest('36. Test GET with suffix Range: bytes=-1024 on Google CDN returns status 200 OK (RFC 9110 Section 14.2)', async () => {
-  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4', {
+  const req = new Request('https://edge.cloudstream.local/dav/user_google_test/SampleGoogleMovie.mp4?proxy=1', {
     method: 'GET',
     headers: { Range: 'bytes=-1024' },
   });

@@ -1008,8 +1008,7 @@ export default {
           const forceProxy =
             url.searchParams.get("proxy") === "1" ||
             url.searchParams.get("proxy") === "true" ||
-            request.headers.get("X-Stream-Mode") === "proxy" ||
-            isGoogleCdn(mount.upstream_url);
+            request.headers.get("X-Stream-Mode") === "proxy";
 
           if (!forceProxy) {
             // Default: Direct 302 CDN redirection for full wire speed streaming
@@ -1132,8 +1131,8 @@ export default {
                 if (reqEnd !== null && reqEnd < totalBytes - 1 && upstreamResp.body) {
                   responseBody = createRangeStream(upstreamResp.body, 0, contentLength);
                 }
-              } else if (!isSuffixRange && reqStart !== null && reqStart > 0 && reqStart <= 10 * 1024 * 1024) {
-                // Small seek offset (<= 10MB) on progressive upstream: skip bytes!
+              } else if (!isSuffixRange && reqStart !== null && reqStart > 0) {
+                // Seek offset on progressive upstream: stream from reqStart using createRangeStream
                 responseStatus = 206;
                 responseStatusText = "Partial Content";
                 const endByte =
@@ -1150,7 +1149,7 @@ export default {
                   responseBody = createRangeStream(upstreamResp.body, reqStart, take);
                 }
               } else {
-                // reqStart > 10MB or suffix range on non-range upstream:
+                // Suffix range on non-range upstream:
                 // RFC 9110 Section 14.2: When origin cannot satisfy byte range, the server MAY ignore
                 // the Range header and return the entire representation with 200 OK.
                 // This satisfies OkHttp validation in CX File Explorer (isSuccessful() === true)
